@@ -1,74 +1,217 @@
-# Kafka Homework 1 - Basic Producer/Consumer
+# Kafka Homework 1 — Basic Producer/Consumer
 
-## Описание
+## 📌 Описание
 Домашнее задание по теме "Базовый producer/consumer, ключи сообщений, partitioning и consumer groups".
 
-## Выполненные задачи
+**Цель работы:**  
+Реализовать взаимодействие producer и consumer в Kafka с использованием ключей сообщений, partitioning и consumer groups для проверки распределения сообщений между partitions и организации независимого чтения данных.
 
-### 1. Настройка Kafka
-- Запущен Kafka через Docker Compose (KRaft mode)
-- Создан топик `orders.events` с 3 партициями
+---
 
-### 2. Реализация Producer
-- Отправлено 12 сообщений в топик `orders.events`
-- В качестве ключа используется `userId`
-- Вывод информации о каждой отправке: key, partition, offset
+## 📁 Структура проекта
 
-### 3. Реализация Consumer
-- Чтение сообщений из топика `orders.events`
-- Вывод: имя consumer, group.id, key, partition, offset, сообщение
+```
+kafka-training/
+├── src/
+│   └── main/
+│       └── java/
+│           └── ru/
+│               └── otus/
+│                   └── kafka/
+│                       └── training/
+│                           └── TrainingApp.java   # Основной класс с producer и consumer
+├── docker-compose.yml       # Docker Compose с Kafka (KRaft) и PostgreSQL
+├── Dockerfile               # Сборка Java-приложения
+├── pom.xml                  # Maven зависимости
+├── demo.cmd                 # Запуск демо-режимов
+├── start.cmd                # Запуск инфраструктуры
+├── status.cmd               # Статус контейнеров
+├── stop.cmd                 # Остановка и очистка
+└── README.md                # Этот файл
+```
 
-### 4. Проверка Consumer Groups
-- Запущено 2 consumer с одинаковым `group.id=order-group-1`
-- Партиции распределились между ними
-- Запущен consumer с `group.id=order-group-2`
-- Новая группа прочитала все сообщения независимо
+---
 
-### 5. Проверка Partitioning
-- Сообщения с одинаковым `userId` попадают в одну партицию
-- userId=10 → partition 0
-- userId=20 → partition 1
-- userId=30 → partition 2
+## ⚙️ Требования
 
-## Результаты проверки
+- **Docker Desktop** (с WSL2)
+- **Java 21** (для локального запуска)
+- **Git** (для клонирования)
 
-### Consumer Group 1 (order-group-1)
-consumer-1: получил партиции 0 и 2
-consumer-2: получил партицию 1
+---
 
-### Consumer Group 2 (order-group-2)
-consumer-3: получил все партиции (0, 1, 2)
+## 🚀 Запуск
 
-### Partitioning
-| userId | Partition | Количество сообщений |
-|--------|-----------|---------------------|
-| 10     | 0         | 4                   |
-| 20     | 1         | 4                   |
-| 30     | 2         | 4                   |
-
-## Запуск
-
+### 1. Клонирование репозитория
 ```bash
-# Поднять инфраструктуру
-docker-compose up -d
+git clone git@github.com:username/kafka-homework-1.git
+cd kafka-homework-1
+```
 
-# Инициализация (создание топиков)
-./demo.cmd init
+### 2. Запуск инфраструктуры
+```bash
+start.cmd
+```
 
-# Запуск Producer
-./demo.cmd producer
+### 3. Инициализация (создание топиков и таблиц)
+```bash
+demo.cmd init
+```
 
-# Запуск Consumer (в разных консолях)
-./demo.cmd consumer consumer-1 order-group-1
-./demo.cmd consumer consumer-2 order-group-1
-./demo.cmd consumer consumer-3 order-group-2
+### 4. Запуск Producer
+```bash
+demo.cmd producer
+```
 
-##*Технологии*
-Java 21
+**Вывод Producer:**  
+Каждое сообщение выводит:
+- `topic` — имя топика
+- `partition` — номер партиции
+- `offset` — смещение в партиции
+- `key` — userId (используется для маршрутизации)
 
-Apache Kafka 4.3.1
+### 5. Запуск Consumer
 
-Docker Compose
+**Первый consumer (группа order-group-1):**
+```bash
+demo.cmd consumer consumer-1 order-group-1
+```
 
-PostgreSQL 16 (для outbox/inbox паттернов)
+**Второй consumer (та же группа) — в новой консоли:**
+```bash
+demo.cmd consumer consumer-2 order-group-1
+```
 
+**Третий consumer (другая группа) — в новой консоли:**
+```bash
+demo.cmd consumer consumer-3 order-group-2
+```
+
+---
+
+## ✅ Результаты проверки
+
+### 1. Распределение сообщений по партициям
+
+| userId | Партиция | Количество сообщений |
+|--------|----------|---------------------|
+| 10     | 0        | 4                   |
+| 20     | 1        | 4                   |
+| 30     | 2        | 4                   |
+
+**Вывод:** Все сообщения с одинаковым `userId` попали в одну партицию.  
+Это подтверждает, что `key` используется для вычисления партиции (`hash(key) % partitions`).
+
+---
+
+### 2. Consumer Group 1 (`order-group-1`)
+
+| Consumer  | Полученные партиции |
+|-----------|---------------------|
+| consumer-1 | 0, 2                |
+| consumer-2 | 1                   |
+
+**Вывод:** Два consumer в одной группе делят партиции между собой.  
+Каждый consumer обрабатывает свою часть сообщений.
+
+---
+
+### 3. Consumer Group 2 (`order-group-2`)
+
+| Consumer  | Полученные партиции |
+|-----------|---------------------|
+| consumer-3 | 0, 1, 2             |
+
+**Вывод:** Consumer с новой группой получает все партиции независимо от других групп.  
+Это позволяет разным сервисам читать одни и те же данные без конфликтов.
+
+---
+
+## 📊 Логи выполнения
+
+### Producer
+```
+[demo] send topic=orders.events partition=0 offset=0 key=10 eventType=OrderPlaced
+[demo] send topic=orders.events partition=1 offset=0 key=20 eventType=OrderPlaced
+[demo] send topic=orders.events partition=2 offset=0 key=30 eventType=OrderPlaced
+[demo] send topic=orders.events partition=0 offset=1 key=10 eventType=OrderPlaced
+...
+```
+
+### Consumer (group=order-group-1)
+```
+[consumer-1] CONSUMER: group=order-group-1, key=10, partition=0, offset=0, orderId=1, userId=10, product=Keyboard
+[consumer-2] CONSUMER: group=order-group-1, key=20, partition=1, offset=0, orderId=2, userId=20, product=Mouse
+[consumer-1] CONSUMER: group=order-group-1, key=30, partition=2, offset=0, orderId=3, userId=30, product=Monitor
+...
+```
+
+### Consumer (group=order-group-2)
+```
+[consumer-3] CONSUMER: group=order-group-2, key=10, partition=0, offset=0, orderId=1, userId=10, product=Keyboard
+[consumer-3] CONSUMER: group=order-group-2, key=20, partition=1, offset=0, orderId=2, userId=20, product=Mouse
+[consumer-3] CONSUMER: group=order-group-2, key=30, partition=2, offset=0, orderId=3, userId=30, product=Monitor
+...
+```
+
+---
+
+## 🧠 Выводы
+
+1. **Partitioning по ключу:**  
+   Сообщения с одинаковым `key` всегда попадают в одну партицию.  
+   Это гарантирует порядок обработки для одного `userId`.
+
+2. **Consumer Groups:**  
+   - В одной группе — партиции делятся между consumer (масштабирование).  
+   - В разных группах — каждая группа получает все сообщения (разные бизнес-функции).
+
+3. **Offset:**  
+   Каждое сообщение имеет уникальный offset внутри партиции.  
+   Offset позволяет consumer управлять позицией чтения.
+
+4. **Auto-offset-reset=earliest:**  
+   Позволяет новой группе прочитать все сообщения с начала.
+
+---
+
+## 🛠️ Технологии
+
+| Компонент | Версия |
+|-----------|--------|
+| Java | 21 |
+| Apache Kafka | 4.3.1 (KRaft mode) |
+| PostgreSQL | 16 |
+| Docker Compose | latest |
+| Maven | 3.9.9 |
+
+---
+
+## 📝 Комментарии по коду
+
+### Producer
+- Использует `userId` в качестве `key`
+- Отправляет 12 сообщений с разными `userId` (10, 20, 30)
+- Выводит `topic`, `partition`, `offset` для каждого сообщения
+
+### Consumer
+- Поддерживает фиксированную `group.id` (без UUID)
+- Читает с самого начала (`auto.offset.reset=earliest`)
+- Использует ручной `commitSync()` для контроля оффсетов
+- Выводит имя consumer, group, key, partition, offset и содержимое
+
+---
+
+## 📎 Ссылки
+
+- [Apache Kafka Documentation](https://kafka.apache.org/documentation/)
+- [KRaft Mode (без ZooKeeper)](https://kafka.apache.org/documentation/#kraft)
+- [Consumer Groups Explained](https://www.conduktor.io/kafka/kafka-consumer-groups/)
+
+---
+
+## 👨‍🎓 Автор
+
+**Имя:** [Ilyas]  
+**Курс:** Otus Kafka Training  
+**Дата:** [2026-09-02]
