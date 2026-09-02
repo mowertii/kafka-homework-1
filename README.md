@@ -44,7 +44,7 @@ kafka-training/
 
 ### 1. Клонирование репозитория
 ```bash
-git clone git@github.com:username/kafka-homework-1.git
+git clone git@github.com:mowertii/kafka-homework-1.git
 cd kafka-homework-1
 ```
 
@@ -213,5 +213,5 @@ demo.cmd consumer consumer-3 order-group-2
 ## 👨‍🎓 Автор
 
 **Имя:** [Ilyas]  
-**Курс:** Otus Kafka Training  
+**Курс:** Otus "Администрирование платформы Apache Kafka"
 **Дата:** [2026-09-02]
