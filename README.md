@@ -8,8 +8,8 @@
 
 | # | Название | Ветка | Статус |
 |---|----------|-------|--------|
-| 1 | Basic Producer/Consumer | [feature/homework-1](https://github.com/username/kafka-training/tree/feature/homework-1) | ✅ Готово |
-| 2 | Reliable Delivery | [feature/homework-2](https://github.com/username/kafka-training/tree/feature/homework-2) | ✅ Готово |
+| 1 | Basic Producer/Consumer | [feature/homework-1](https://github.com/mowertii/kafka-training/tree/feature/homework-1) | ✅ Готово |
+| 2 | Reliable Delivery | [feature/homework-2](https://github.com/mowertii/kafka-training/tree/feature/homework-2) | ✅ Готово |
 | 3 | ... | ... | ... |
 
 ---
