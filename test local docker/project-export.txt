@@ -216,6 +216,7 @@ public class TrainingApp {
     public static void main(String[] args) throws Exception {
         if (args.length == 0 || args[0].equals("help")) { help(); return; }
         log("bootstrap.servers=" + BOOTSTRAP);
+        
         switch (args[0]) {
             case "init" -> init();
             case "basic-entities" -> basicEntities();
@@ -231,13 +232,17 @@ public class TrainingApp {
             case "good-separate-groups" -> goodSeparateGroups();
             case "bad-universal-topic" -> badUniversalTopic();
             case "audit-replay" -> auditReplay();
-            case "all" -> { init(); basicEntities(); partitionOrder(); consumerGroups(); eventStyles(); outbox(); inbox(); cqrsSaga(); retryDlt(); contractEvolution(); badSharedGroup(); goodSeparateGroups(); badUniversalTopic(); auditReplay(); }
+            case "producer" -> runProducer();            // Производитель
+            case "consumer" -> runConsumer(args);        // Потребитель
+            case "producer-safe" -> runProducerSafe();   // продюсер с настройками надежности
+            case "consumer-safe" -> runConsumerSafe(args); // консьюмер с ручным коммитом 
+            case "all" -> { /* ... */ }
             default -> { System.err.println("Unknown mode: " + args[0]); help(); System.exit(2); }
         }
     }
 
     private static void help() {
-        System.out.println("Modes: init, basic-entities, partition-order, consumer-groups, event-styles, outbox, inbox, cqrs-saga, retry-dlt, contract, bad-shared-group, good-separate-groups, bad-universal-topic, audit-replay, all");
+        System.out.println("Modes: init, basic-entities, partition-order, consumer-groups, event-styles, outbox, inbox, cqrs-saga, retry-dlt, contract, bad-shared-group, good-separate-groups, bad-universal-topic, audit-replay, producer, consumer, producer-safe, consumer-safe, all");
     }
 
     private static void init() throws Exception {
@@ -317,15 +322,17 @@ public class TrainingApp {
         banner("SLIDE 13 — Transactional Outbox removes dual-write hole");
         try (Connection c = db()) {
             st(c, "delete from outbox"); st(c, "delete from orders where id='order-outbox-1'");
-            c.setAutoCommit(false);
+            c.setAutoCommit(false); // НАЧИНАЕМ ТРАНЗАКЦИЮ
+            // 1. Сохраняем заказ
             try (PreparedStatement order = c.prepareStatement("insert into orders(id,status,amount) values(?,?,?)");
-                 PreparedStatement out = c.prepareStatement("insert into outbox(id,aggregate_id,event_type,payload) values(?::uuid,?,?,?)")) {
+                // 2. Сохраняем событие в outbox
+                PreparedStatement out = c.prepareStatement("insert into outbox(id,aggregate_id,event_type,payload) values(?::uuid,?,?,?)")) {
                 order.setString(1, "order-outbox-1"); order.setString(2, "PAID"); order.setInt(3, 1200); order.executeUpdate();
                 String eventId = UUID.randomUUID().toString();
                 out.setString(1, eventId); out.setString(2, "order-outbox-1"); out.setString(3, "OrderPaid");
                 out.setString(4, eventWithId(eventId, "OrderPaid", "order-outbox-1", Map.of("amount", 1200)));
                 out.executeUpdate();
-                c.commit();
+                c.commit(); // КОММИТИМ ТРАНЗАКЦИЮ
                 log("DB transaction committed: order row + outbox row exist together. Nothing has been sent to Kafka yet.");
             } catch (Exception e) { c.rollback(); throw e; }
         }
@@ -354,31 +361,42 @@ public class TrainingApp {
         banner("SLIDE 15 — CQRS projection plus choreography-style saga");
         try (Connection c = db()) { st(c, "delete from order_projection where order_id='saga-42'"); }
         try (KafkaProducer<String, String> p = producer()) {
+            // 1. Заказ создан
             send(p, "orders.events", "saga-42", event("OrderCreated", "saga-42", Map.of("amount", 990)));
         }
         // Choreography: services react and emit next facts.
+        // 2. Ждем, пока Payment Service обработает и создаст PaymentReserved
         JsonNode orderCreated = takeOne("orders.events", "payment-service", Duration.ofSeconds(5));
         try (KafkaProducer<String, String> p = producer()) { send(p, "payments.events", "saga-42", event("PaymentReserved", "saga-42", Map.of("paymentId", "pay-42"))); }
+        // 3. Ждем, пока Warehouse Service обработает и создаст StockReserved
         JsonNode paymentReserved = takeOne("payments.events", "warehouse-service", Duration.ofSeconds(5));
         try (KafkaProducer<String, String> p = producer()) { send(p, "warehouse.events", "saga-42", event("StockReserved", "saga-42", Map.of("sku", "book-1"))); }
+        // 4. Ждем, пока Order Service обработает и подтвердит заказ
         JsonNode stockReserved = takeOne("warehouse.events", "order-service", Duration.ofSeconds(5));
         try (KafkaProducer<String, String> p = producer()) { send(p, "orders.events", "saga-42", event("OrderConfirmed", "saga-42", Map.of("status", "CONFIRMED", "amount", 990))); }
         projectOrders(4);
         queryProjection("saga-42");
         log("Meaning: each service owns one step. Read model is rebuilt from events and is eventually consistent.");
     }
-
+    // Retry Topic
     private static void retryDlt() throws Exception {
         banner("SLIDE 16 — bounded retry topics and DLT with reason");
+        // Отправляем 4 сообщения с разными сценариями
         try (KafkaProducer<String, String> p = producer()) {
+            // 1. OK — обработается сразу
             send(p, "orders.events", "ok-1", event("OrderPaid", "ok-1", Map.of("case", "ok")));
+            // 2. Временная ошибка — перейдет в retry.1
             send(p, "orders.events", "temp-1", event("OrderPaid", "temp-1", Map.of("case", "temporary")));
+            // 3. Долгая временная ошибка — перейдет в retry.2
             send(p, "orders.events", "slow-1", event("OrderPaid", "slow-1", Map.of("case", "temporary-long")));
+            // 4. Фатальная ошибка — сразу в DLT
             send(p, "orders.events", "bad-1", event("OrderPaid", "bad-1", Map.of("case", "poison", "schema", "invalid business field")));
         }
+        // Обработка с 3 уровнями retry
         processWithRetry("orders.events", "orders.retry.1", "orders.dlt", "retry-demo-main", 4, 1);
         processWithRetry("orders.retry.1", "orders.retry.2", "orders.dlt", "retry-demo-r1", 2, 2);
         processWithRetry("orders.retry.2", "orders.dlt", "orders.dlt", "retry-demo-r2", 1, 3);
+        // Проверяем, что в DLT попало только одно сообщение
         consumeFixed("dlt-ops", "orders.dlt", 1, Duration.ofSeconds(5));
         log("Meaning: retries are finite and observable; DLT has failed messages plus reason headers, not just a silent trash bin.");
     }
@@ -431,20 +449,300 @@ public class TrainingApp {
 
     private static void auditReplay() throws Exception {
         banner("SLIDE 20 / 25 — audit log and replay into a projection");
+        // 1. Очищаем проекцию
         try (Connection c = db()) { st(c, "delete from order_projection where order_id like 'replay-%'"); }
+        // 2. Отправляем события в топик audit.events
         try (KafkaProducer<String, String> p = producer()) {
             send(p, "audit.events", "replay-1", event("OrderCreated", "replay-1", Map.of("amount", 10)));
             send(p, "audit.events", "replay-1", event("OrderPaid", "replay-1", Map.of("amount", 10)));
             send(p, "audit.events", "replay-2", event("OrderCreated", "replay-2", Map.of("amount", 20)));
         }
+        // 3. ВЕРСИЯ 1 — строим проекцию (может быть с багом)
         projectFromTopic("audit.events", "audit-replay-v1", 3);
         queryProjection("replay-1");
         log("Now pretend read-model code was fixed. Use a NEW group to replay same retained log:");
+        // 4. ВЕРСИЯ 2 — снова строим проекцию с НОВОЙ группой
+        // Новая группа = перечитываем все события с начала!
         projectFromTopic("audit.events", "audit-replay-v2", 3);
         queryProjection("replay-2");
         log("Meaning: retained log can rebuild read models. This is a system property you do not get from a transient queue by default.");
     }
+    /**
+     * Режим PRODUCER
+     * Отправляет 12 сообщений в топик orders с разными userId в качестве ключей
+     * 
+     * 1. Метод демонстрирует, как key влияет на распределение по партициям
+     * 2. Показывает, что одинаковый key → всегда одна партиция
+     * 3. Выводит key, partition, offset для каждого сообщения
+     * 
+     * Почему используем существующие методы?
+     * - producer() уже создает KafkaProducer с правильными настройками
+     * - send() уже отправляет сообщение и выводит метаданные
+     * - Не нужно дублировать код!
+     */
+    private static void runProducer() throws Exception {
+        banner("PRODUCER — отправка сообщений в топик orders");
+        
+        String topic = "orders.events"; // Имя топика согласно ТЗ
+        
+        try (KafkaProducer<String, String> p = producer()) {
+            // Отправляем 12 сообщений (минимум 10 по ТЗ)
+            for (int i = 1; i <= 12; i++) {
+                // userId: 10, 20, 30, 10, 20, 30, ...
+                // Почему так? Чтобы увидеть, что одинаковые userId попадают в одну партицию
+                int userId = switch (i % 3) {
+                    case 0 -> 30;
+                    case 1 -> 10;
+                    default -> 20;
+                };
+                
+                // Формируем JSON согласно ТЗ
+                // Используем существующий метод event(), который создает событие с нужной структурой
+                String value = event(
+                    "OrderPlaced",                              // eventType
+                    "order-" + i,                               // aggregateId (используем как orderId)
+                    Map.of(
+                        "orderId", i,                           // orderId
+                        "userId", userId,                       // userId
+                        "product", getProductForOrder(i)        // product
+                    )
+                );
+                
+                // Ключ = userId (превращаем в строку, так как сериализатор строковый)
+                String key = String.valueOf(userId);
+                
+                // Отправляем с синхронным ожиданием (.get())
+                // Используем существующий send(), который уже выводит:
+                // topic, partition, offset, key, eventType
+                send(p, topic, key, value);
+            }
+        }
+        
+        log("Все сообщения отправлены. Используйте consumer для чтения.");
+    }
 
+    /**
+     * Вспомогательный метод для выбора продукта по номеру заказа
+     * Просто для разнообразия данных
+     */
+    private static String getProductForOrder(int orderId) {
+        String[] products = {"Keyboard", "Mouse", "Monitor", "Laptop", "Headphones", 
+                            "Tablet", "Printer", "Scanner", "Speaker", "Camera", 
+                            "Drone", "Smartwatch"};
+        return products[(orderId - 1) % products.length];
+    }
+
+    /**
+     * Режим CONSUMER для домашнего задания
+     * Читает сообщения из топика orders
+     * 
+     * Аргументы командной строки:
+     * - args[1]: имя consumer (для вывода в логах)
+     * - args[2]: group.id (для демонстрации consumer groups)
+     * 
+     * Примеры запуска:
+     * consumer consumer-1 order-group-1   // первый consumer в группе 1
+     * consumer consumer-2 order-group-1   // второй consumer в группе 1
+     * consumer consumer-3 order-group-2   // consumer в другой группе
+     * 
+     * Почему используем существующие методы?
+     * - consumer(group) создает Consumer с правильными настройками
+     * - В нем уже есть auto.offset.reset=earliest (читаем с начала)
+     * - В нем уже есть enable.auto.commit=false (ручной контроль)
+     * 
+     * Зачем нужен ручной commitSync()?
+     * - Чтобы гарантировать, что оффсет сохранится только после обработки
+     * - Для демонстрации работы consumer groups
+     */
+    private static void runConsumer(String[] args) throws Exception {
+        // Получаем имя consumer и group.id из аргументов
+        // Используем args
+        String consumerName = args.length > 1 ? args[1] : "consumer-1";
+        String groupId = args.length > 2 ? args[2] : "order-group-1";
+        
+        banner("CONSUMER — name=" + consumerName + ", group=" + groupId);
+        
+        String topic = "orders.events";
+        Properties props = new Properties();
+        props.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, BOOTSTRAP);
+        props.put(ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class.getName());
+        props.put(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class.getName());
+        props.put(ConsumerConfig.GROUP_ID_CONFIG, groupId);
+        props.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest"); //читаем с самого начала (нужно для демонстрации)
+        props.put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, "false"); //ручной контроль (ключевое требование ДЗ)
+        
+        try (KafkaConsumer<String, String> consumer = new KafkaConsumer<>(props)) {
+            consumer.subscribe(List.of(topic));
+            
+            int count = 0;
+            long until = System.currentTimeMillis() + 15000;
+            
+            while (System.currentTimeMillis() < until && count < 12) {
+                ConsumerRecords<String, String> records = consumer.poll(Duration.ofMillis(500));
+                for (ConsumerRecord<String, String> record : records) {
+                    count++;
+                    JsonNode json = JSON.readTree(record.value());
+                    JsonNode payload = json.path("payload");
+                    System.out.printf("[%s] CONSUMER: group=%s, key=%s, partition=%d, offset=%d, orderId=%d, userId=%d, product=%s%n",
+                        consumerName, groupId, record.key(), record.partition(), record.offset(),
+                        payload.path("orderId").asInt(), payload.path("userId").asInt(),
+                        payload.path("product").asText("unknown"));
+                }
+                consumer.commitSync();
+            }
+            
+            log("Consumer '" + consumerName + "' завершил работу. Прочитано сообщений: " + count);
+        }
+    }
+    /**
+     * Режим PRODUCER с настройками надежности для ДЗ №2
+     * 
+     * Настройки надежности:
+     * - acks=all — подтверждение от всех реплик в ISR
+     * - retries=5 — повторные попытки при ошибках
+     * - enable.idempotence=true — защита от дублей
+     * 
+     * Зачем:
+     * - acks=all: гарантирует, что сообщение не потеряется при падении брокера
+     * - retries: спасает от временных сетевых проблем
+     * - idempotence: Producer не создаст дубли даже при повторных отправках
+     */
+    private static void runProducerSafe() throws Exception {
+        banner("PRODUCER SAFE — надежная доставка с acks=all, retries, idempotence");
+        
+        String topic = "orders.events";
+        
+        Properties props = new Properties();
+        props.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, BOOTSTRAP);
+        props.put(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, StringSerializer.class.getName());
+        props.put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, StringSerializer.class.getName());
+        
+        // Настройки надежности
+        props.put(ProducerConfig.ACKS_CONFIG, "all");
+        props.put(ProducerConfig.RETRIES_CONFIG, 5);
+        props.put(ProducerConfig.ENABLE_IDEMPOTENCE_CONFIG, "true");
+        props.put(ProducerConfig.MAX_IN_FLIGHT_REQUESTS_PER_CONNECTION, 5);
+        props.put(ProducerConfig.DELIVERY_TIMEOUT_MS_CONFIG, 120000);
+        
+        try (KafkaProducer<String, String> producer = new KafkaProducer<>(props)) {
+            for (int i = 1; i <= 10; i++) {
+                int userId = switch (i % 3) {
+                    case 0 -> 30;
+                    case 1 -> 10;
+                    default -> 20;
+                };
+                
+                String value = event(
+                    "OrderPlaced",
+                    "order-" + i,
+                    Map.of(
+                        "orderId", i,
+                        "userId", userId,
+                        "product", getProductForOrder(i)
+                    )
+                );
+                
+                String key = String.valueOf(userId);
+                ProducerRecord<String, String> record = new ProducerRecord<>(topic, key, value);
+                
+                try {
+                    RecordMetadata metadata = producer.send(record).get();
+                    System.out.printf("[PRODUCER-SAFE] ✅ SUCCESS: key=%s, partition=%d, offset=%d, orderId=%d%n",
+                        key, metadata.partition(), metadata.offset(), i);
+                } catch (Exception e) {
+                    System.err.printf("[PRODUCER-SAFE] ❌ ERROR: key=%s, orderId=%d, error=%s%n",
+                        key, i, e.getMessage());
+                }
+            }
+        }
+        
+        log("Все сообщения отправлены с настройками надежности.");
+    }
+    /**
+     * Режим CONSUMER SAFE для ДЗ №2
+     * Настройки:
+     * - enable.auto.commit=false — ручной контроль offset
+     * - commitSync() только после успешной обработки
+     * - auto.offset.reset=earliest — читаем с начала
+     * 
+     * Аргументы командной строки:
+     * - args[1]: имя consumer
+     * - args[2]: group.id
+     * 
+     * Пример:
+     * consumer-safe consumer-1 consumer-safe-group
+     */
+    private static void runConsumerSafe(String[] args) throws Exception {
+        String consumerName = args.length > 1 ? args[1] : "consumer-safe-1";
+        String groupId = args.length > 2 ? args[2] : "consumer-safe-group";
+        
+        banner("CONSUMER SAFE — name=" + consumerName + ", group=" + groupId);
+        
+        String topic = "orders.events";
+        
+        Properties props = new Properties();
+        props.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, BOOTSTRAP);
+        props.put(ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class.getName());
+        props.put(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class.getName());
+        props.put(ConsumerConfig.GROUP_ID_CONFIG, groupId);
+        
+        // 👇 КЛЮЧЕВОЙ МОМЕНТ: читаем с самого начала
+        props.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest");
+        
+        // 👇 Ручной контроль offset (требование ДЗ)
+        props.put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, "false");
+        
+        try (KafkaConsumer<String, String> consumer = new KafkaConsumer<>(props)) {
+            consumer.subscribe(List.of(topic));
+            
+            log("Подписались на топик: " + topic);
+            log("Ожидаем сообщения... (таймаут 15 секунд)");
+            log("Начинаем чтение...");
+            
+            int count = 0;
+            long until = System.currentTimeMillis() + 15000;
+            
+            while (System.currentTimeMillis() < until) {
+                ConsumerRecords<String, String> records = consumer.poll(Duration.ofMillis(1000));
+                
+                if (records.isEmpty()) {
+                    // 👇 Отладка: видно, что consumer работает, но сообщений нет
+                    log("Нет сообщений, продолжаем ждать...");
+                    continue;
+                }
+                
+                for (ConsumerRecord<String, String> record : records) {
+                    try {
+                        JsonNode json = JSON.readTree(record.value());
+                        JsonNode payload = json.path("payload");
+                        
+                        // Вывод информации о сообщении
+                        System.out.printf("[%s] PROCESSING: key=%s, partition=%d, offset=%d, orderId=%d, userId=%d%n",
+                            consumerName,
+                            record.key(),
+                            record.partition(),
+                            record.offset(),
+                            payload.path("orderId").asInt(),
+                            payload.path("userId").asInt()
+                        );
+                        
+                        // ✅ Успешная обработка → коммитим offset
+                        consumer.commitSync();
+                        count++;
+                        
+                        System.out.printf("[%s] ✅ COMMITTED: offset=%d%n", consumerName, record.offset());
+                        
+                    } catch (Exception e) {
+                        // ❌ Ошибка обработки — offset НЕ КОММИТИМ!
+                        System.err.printf("[%s] ❌ PROCESSING ERROR: offset=%d, error=%s%n",
+                            consumerName, record.offset(), e.getMessage());
+                    }
+                }
+            }
+            
+            log("Consumer '" + consumerName + "' завершил работу. Обработано сообщений: " + count);
+        }
+    }
     // ---------- Kafka helpers ----------
     private static KafkaProducer<String, String> producer() {
         Properties p = new Properties();
@@ -579,15 +877,19 @@ public class TrainingApp {
     private static void relayOutboxOnce() throws Exception {
         try (Connection c = db(); KafkaProducer<String,String> p = producer()) {
             c.setAutoCommit(false);
+            // Забираем неопубликованные события (с блокировкой строк)
             try (PreparedStatement ps = c.prepareStatement("select id, aggregate_id, payload from outbox where published=false order by created_at for update skip locked")) {
+                // ^ Защита от конкурентных релеев
                 ResultSet rs = ps.executeQuery();
                 while (rs.next()) {
                     String id = rs.getString(1); String key = rs.getString(2); String payload = rs.getString(3);
+                    // Отправляем в Kafka
                     send(p, "orders.events", key, payload);
+                    // Помечаем как опубликованное
                     try (PreparedStatement upd = c.prepareStatement("update outbox set published=true where id=?::uuid")) { upd.setString(1, id); upd.executeUpdate(); }
                 }
             }
-            c.commit();
+            c.commit(); // < Фиксируем все изменения
         }
     }
 
@@ -602,15 +904,21 @@ public class TrainingApp {
                     seen++;
                     try (Connection db = db()) {
                         db.setAutoCommit(false);
+                        // Consumer проверяет, не обрабатывал ли уже это событие
                         String eventId = e.path("eventId").asText();
                         if (exists(db, "select 1 from inbox where event_id=?::uuid", eventId)) {
-                            log("duplicate eventId=%s -> skip business side effect".formatted(eventId)); db.rollback(); continue;
+                            log("duplicate eventId=%s -> skip business side effect".formatted(eventId)); 
+                            db.rollback(); // < Пропускаем дубль 
+                            continue; 
                         }
+                        // 1. Делаем бизнес-логику (создаем платеж)
                         try (PreparedStatement pay = db.prepareStatement("insert into billing_payments(order_id, amount) values (?, ?) on conflict(order_id) do nothing");
-                             PreparedStatement inbox = db.prepareStatement("insert into inbox(event_id) values (?::uuid)")) {
+                            // 2. Записываем eventId в inbox, чтобы не обрабатывать дубли
+                            PreparedStatement inbox = db.prepareStatement("insert into inbox(event_id) values (?::uuid)")) {
                             pay.setString(1, e.path("aggregateId").asText()); pay.setInt(2, e.path("payload").path("amount").asInt()); pay.executeUpdate();
                             inbox.setString(1, eventId); inbox.executeUpdate();
-                            db.commit(); log("applied payment once, marked eventId=" + eventId);
+                            db.commit(); // < Всё в одной транзакции!
+                            log("applied payment once, marked eventId=" + eventId);
                         }
                     }
                 }
@@ -621,6 +929,8 @@ public class TrainingApp {
 
     private static void projectOrders(int expected) throws Exception { projectFromTopic("orders.events", "orders-readmodel-demo", expected); }
     private static void projectFromTopic(String topic, String group, int expected) throws Exception {
+        // Создаем Consumer с указанной группой
+        // ВАЖНО: Если группа новая — читаем с начала (auto.offset.reset=earliest)
         try (KafkaConsumer<String,String> c = consumer(group)) {
             c.subscribe(List.of(topic));
             int count=0; long until = System.currentTimeMillis()+8000;
@@ -629,9 +939,13 @@ public class TrainingApp {
                     JsonNode e = JSON.readTree(r.value());
                     String type = e.path("eventType").asText();
                     String orderId = e.path("aggregateId").asText();
+                    // Обрабатываем только события заказов
                     if (!type.startsWith("Order")) continue;
+                    // Определяем статус
                     String status = switch (type) { case "OrderCreated" -> "CREATED"; case "OrderPaid" -> "PAID"; case "OrderConfirmed" -> "CONFIRMED"; default -> type; };
                     int amount = e.path("payload").path("amount").asInt(0);
+                    // 👇 БИЗНЕС-ЛОГИКА: обновляем Read Model
+                    // Если здесь был баг — его исправляют в новой версии кода
                     try (Connection db = db(); PreparedStatement ps = db.prepareStatement("insert into order_projection(order_id,status,amount,last_event_id) values(?,?,?,?) on conflict(order_id) do update set status=excluded.status, amount=greatest(order_projection.amount, excluded.amount), last_event_id=excluded.last_event_id, updated_at=now()")) {
                         ps.setString(1, orderId); ps.setString(2, status); ps.setInt(3, amount); ps.setString(4, e.path("eventId").asText()); ps.executeUpdate();
                     }
@@ -657,11 +971,16 @@ public class TrainingApp {
                 for (ConsumerRecord<String,String> r : c.poll(Duration.ofMillis(500))) {
                     JsonNode e = JSON.readTree(r.value());
                     String kase = e.path("payload").path("case").asText("ok"); count++;
+                    // 👇 ЛОГИКА РЕШЕНИЯ: успех или новая попытка?
                     if ("ok".equals(kase) || ("temporary".equals(kase) && attempt >= 2) || ("temporary-long".equals(kase) && attempt >= 3)) {
+                        // ✅ Успех!
                         log("processed ok after attempt=%d key=%s case=%s".formatted(attempt, r.key(), kase));
+                    // ❌ Ошибка — отправляем дальше по цепочке
                     } else {
                         String target = "poison".equals(kase) ? dltTopic : nextTopic;
+                        // Копируем сообщение в новый топик
                         ProducerRecord<String,String> pr = new ProducerRecord<>(target, r.key(), r.value());
+                        // 👇 ДОБАВЛЯЕМ ЗАГОЛОВОК С ПРИЧИНОЙ!
                         pr.headers().add(new RecordHeader("x-error", ("case=" + kase + "; attempt=" + attempt).getBytes(StandardCharsets.UTF_8)));
                         p.send(pr).get();
                         log("failed key=%s case=%s -> %s".formatted(r.key(), kase, target));

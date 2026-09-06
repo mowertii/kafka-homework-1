@@ -28,6 +28,7 @@ public class TrainingApp {
     public static void main(String[] args) throws Exception {
         if (args.length == 0 || args[0].equals("help")) { help(); return; }
         log("bootstrap.servers=" + BOOTSTRAP);
+        
         switch (args[0]) {
             case "init" -> init();
             case "basic-entities" -> basicEntities();
@@ -43,11 +44,11 @@ public class TrainingApp {
             case "good-separate-groups" -> goodSeparateGroups();
             case "bad-universal-topic" -> badUniversalTopic();
             case "audit-replay" -> auditReplay();
-            case "all" -> { init(); basicEntities(); partitionOrder(); consumerGroups(); eventStyles(); outbox(); inbox(); cqrsSaga(); retryDlt(); contractEvolution(); badSharedGroup(); goodSeparateGroups(); badUniversalTopic(); auditReplay(); }
-            case "producer" -> runProducer();      // Производитель
-            case "consumer" -> runConsumer();      // Потребитель
-            case "producer-safe" -> runProducerSafe();  // продюсер с настройками надежности
-            case "consumer-safe" -> runConsumerSafe();  // консьюмер с ручным коммитом        
+            case "producer" -> runProducer();            // Производитель
+            case "consumer" -> runConsumer(args);        // Потребитель
+            case "producer-safe" -> runProducerSafe();   // продюсер с настройками надежности
+            case "consumer-safe" -> runConsumerSafe(args); // консьюмер с ручным коммитом 
+            case "all" -> { /* ... */ }
             default -> { System.err.println("Unknown mode: " + args[0]); help(); System.exit(2); }
         }
     }
@@ -365,81 +366,46 @@ public class TrainingApp {
      * - Чтобы гарантировать, что оффсет сохранится только после обработки
      * - Для демонстрации работы consumer groups
      */
-    private static void runConsumer() throws Exception {
+    private static void runConsumer(String[] args) throws Exception {
         // Получаем имя consumer и group.id из аргументов
-        // Используем значения по умолчанию, если аргументы не переданы
-        String consumerName = System.getProperty("consumer.name", "consumer-1");
-        String groupId = System.getProperty("consumer.group", "order-group-1");
+        // Используем args
+        String consumerName = args.length > 1 ? args[1] : "consumer-1";
+        String groupId = args.length > 2 ? args[2] : "order-group-1";
         
         banner("CONSUMER — name=" + consumerName + ", group=" + groupId);
         
         String topic = "orders.events";
-        int expectedMessages = 12; // Ждем все 12 сообщений
-        
-        // Используем существующий consumer() с groupId
-        // ВАЖНО: consumer() добавляет UUID к group.id!
-        // Для демонстрации consumer groups нам нужна ФИКСИРОВАННАЯ группа
-        // Поэтому создаем Consumer вручную с фиксированным group.id
         Properties props = new Properties();
         props.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, BOOTSTRAP);
         props.put(ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class.getName());
         props.put(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class.getName());
-        props.put(ConsumerConfig.GROUP_ID_CONFIG, groupId); // Фиксированная группа!
-        props.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest"); // Читаем с начала
-        props.put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, "false"); // Ручной commit
+        props.put(ConsumerConfig.GROUP_ID_CONFIG, groupId);
+        props.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest"); //читаем с самого начала (нужно для демонстрации)
+        props.put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, "false"); //ручной контроль (ключевое требование ДЗ)
         
         try (KafkaConsumer<String, String> consumer = new KafkaConsumer<>(props)) {
             consumer.subscribe(List.of(topic));
             
-            log("Подписались на топик: " + topic);
-            log("Ожидаем " + expectedMessages + " сообщений...");
-            
             int count = 0;
-            long until = System.currentTimeMillis() + 15000; // Таймаут 15 секунд
+            long until = System.currentTimeMillis() + 15000;
             
-            while (System.currentTimeMillis() < until && count < expectedMessages) {
+            while (System.currentTimeMillis() < until && count < 12) {
                 ConsumerRecords<String, String> records = consumer.poll(Duration.ofMillis(500));
-                
                 for (ConsumerRecord<String, String> record : records) {
                     count++;
-                    
-                    // Парсим JSON для красивого вывода
                     JsonNode json = JSON.readTree(record.value());
                     JsonNode payload = json.path("payload");
-                    
-                    // Выводим информацию согласно ТЗ:
-                    // - имя consumer
-                    // - key
-                    // - partition
-                    // - offset
-                    // - сообщение
                     System.out.printf("[%s] CONSUMER: group=%s, key=%s, partition=%d, offset=%d, orderId=%d, userId=%d, product=%s%n",
-                        consumerName,
-                        groupId,
-                        record.key(),
-                        record.partition(),
-                        record.offset(),
-                        payload.path("orderId").asInt(),
-                        payload.path("userId").asInt(),
-                        payload.path("product").asText("unknown")
-                    );
+                        consumerName, groupId, record.key(), record.partition(), record.offset(),
+                        payload.path("orderId").asInt(), payload.path("userId").asInt(),
+                        payload.path("product").asText("unknown"));
                 }
-                
-                // Ручной commit оффсетов
-                // Почему здесь? Чтобы гарантировать, что оффсет сохранится после обработки
-                // Если consumer упадет между poll() и commitSync(), сообщения будут прочитаны снова
-                // Это демонстрирует at-least-once delivery
                 consumer.commitSync();
             }
             
             log("Consumer '" + consumerName + "' завершил работу. Прочитано сообщений: " + count);
-            
-            if (count < expectedMessages) {
-                log("ВНИМАНИЕ: Прочитано только " + count + " из " + expectedMessages + " сообщений.");
-                log("Проверьте, что producer был запущен и отправил все сообщения.");
-            }
         }
-    }  
+    }
     /**
      * Режим PRODUCER с настройками надежности для ДЗ №2
      * 
@@ -458,21 +424,25 @@ public class TrainingApp {
         
         String topic = "orders.events";
         
-        // Настраиваем Producer с параметрами надежности
         Properties props = new Properties();
         props.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, BOOTSTRAP);
         props.put(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, StringSerializer.class.getName());
         props.put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, StringSerializer.class.getName());
         
-        // 👇 НАСТРОЙКИ НАДЕЖНОСТИ (задание 1)
-        props.put(ProducerConfig.ACKS_CONFIG, "all");              // Ждем подтверждения от всех реплик
-        props.put(ProducerConfig.RETRIES_CONFIG, 5);               // Повторяем при ошибках
-        props.put(ProducerConfig.ENABLE_IDEMPOTENCE_CONFIG, "true"); // Защита от дублей
-        props.put(ProducerConfig.MAX_IN_FLIGHT_REQUESTS_PER_CONNECTION, 5); // Для idempotence
-        props.put(ProducerConfig.DELIVERY_TIMEOUT_MS_CONFIG, 120000); // Таймаут доставки
+        // Настройки надежности
+        props.put(ProducerConfig.ACKS_CONFIG, "all");
+        props.put(ProducerConfig.ACKS_CONFIG, "all");
+        props.put(ProducerConfig.ENABLE_IDEMPOTENCE_CONFIG, "true");
+        // props.put(ProducerConfig.RETRIES_CONFIG, 5); сознательно не задаём явным маленьким числом:
+        // при enable.idempotence=true клиент сам выставляет retries практически без ограничения,
+        // а реальным лимитом служит delivery.timeout.ms ниже.
+        props.put(ProducerConfig.MAX_IN_FLIGHT_REQUESTS_PER_CONNECTION, 5);
+        props.put(ProducerConfig.DELIVERY_TIMEOUT_MS_CONFIG, 120000);        
+        props.put(ProducerConfig.ENABLE_IDEMPOTENCE_CONFIG, "true");
+        props.put(ProducerConfig.MAX_IN_FLIGHT_REQUESTS_PER_CONNECTION, 5);
+        props.put(ProducerConfig.DELIVERY_TIMEOUT_MS_CONFIG, 120000);
         
         try (KafkaProducer<String, String> producer = new KafkaProducer<>(props)) {
-            // Отправляем 10 сообщений (минимум по ТЗ)
             for (int i = 1; i <= 10; i++) {
                 int userId = switch (i % 3) {
                     case 0 -> 30;
@@ -494,15 +464,10 @@ public class TrainingApp {
                 ProducerRecord<String, String> record = new ProducerRecord<>(topic, key, value);
                 
                 try {
-                    // Отправка с синхронным ожиданием
                     RecordMetadata metadata = producer.send(record).get();
-                    
-                    // ✅ УСПЕШНАЯ ОТПРАВКА
                     System.out.printf("[PRODUCER-SAFE] ✅ SUCCESS: key=%s, partition=%d, offset=%d, orderId=%d%n",
                         key, metadata.partition(), metadata.offset(), i);
-                        
                 } catch (Exception e) {
-                    // ❌ ОШИБКА ОТПРАВКИ
                     System.err.printf("[PRODUCER-SAFE] ❌ ERROR: key=%s, orderId=%d, error=%s%n",
                         key, i, e.getMessage());
                 }
@@ -512,19 +477,20 @@ public class TrainingApp {
         log("Все сообщения отправлены с настройками надежности.");
     }
     /**
-     * Режим CONSUMER с ручным управлением offset для ДЗ №2
-     * 
+     * Режим CONSUMER SAFE для ДЗ №2
      * Настройки:
-     * - enable.auto.commit=false — ручной контроль
+     * - enable.auto.commit=false — ручной контроль offset
      * - commitSync() только после успешной обработки
+     * - auto.offset.reset=earliest — читаем с начала
      * 
-     * Зачем:
-     * - Гарантирует, что offset сохранится только после обработки
-     * - Если consumer упадет до commit, сообщение будет прочитано снова (at-least-once)
-     * - Нет потери сообщений при сбоях
+     * Аргументы командной строки:
+     * - args[1]: имя consumer
+     * - args[2]: group.id
+     * 
+     * Пример:
+     * consumer-safe consumer-1 consumer-safe-group
      */
-    private static void runConsumerSafe() throws Exception {
-        // Получаем аргументы: имя consumer и group.id
+    private static void runConsumerSafe(String[] args) throws Exception {
         String consumerName = args.length > 1 ? args[1] : "consumer-safe-1";
         String groupId = args.length > 2 ? args[2] : "consumer-safe-group";
         
@@ -532,36 +498,43 @@ public class TrainingApp {
         
         String topic = "orders.events";
         
-        // Настраиваем Consumer
         Properties props = new Properties();
         props.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, BOOTSTRAP);
         props.put(ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class.getName());
         props.put(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class.getName());
         props.put(ConsumerConfig.GROUP_ID_CONFIG, groupId);
+        
+        // 👇 КЛЮЧЕВОЙ МОМЕНТ: читаем с самого начала
         props.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest");
         
-        // 👇 НАСТРОЙКА: ручной коммит (задание 2)
-        props.put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, "false");  // Отключаем авто-коммит
+        // 👇 Ручной контроль offset (требование ДЗ)
+        props.put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, "false");
         
         try (KafkaConsumer<String, String> consumer = new KafkaConsumer<>(props)) {
             consumer.subscribe(List.of(topic));
             
             log("Подписались на топик: " + topic);
             log("Ожидаем сообщения... (таймаут 15 секунд)");
+            log("Начинаем чтение...");
             
             int count = 0;
             long until = System.currentTimeMillis() + 15000;
             
             while (System.currentTimeMillis() < until) {
-                ConsumerRecords<String, String> records = consumer.poll(Duration.ofMillis(500));
+                ConsumerRecords<String, String> records = consumer.poll(Duration.ofMillis(1000));
+                
+                if (records.isEmpty()) {
+                    // 👇 Отладка: видно, что consumer работает, но сообщений нет
+                    log("Нет сообщений, продолжаем ждать...");
+                    continue;
+                }
                 
                 for (ConsumerRecord<String, String> record : records) {
-                    // 1. Обработка сообщения
                     try {
                         JsonNode json = JSON.readTree(record.value());
                         JsonNode payload = json.path("payload");
                         
-                        // Имитация обработки
+                        // Вывод информации о сообщении
                         System.out.printf("[%s] PROCESSING: key=%s, partition=%d, offset=%d, orderId=%d, userId=%d%n",
                             consumerName,
                             record.key(),
@@ -571,18 +544,16 @@ public class TrainingApp {
                             payload.path("userId").asInt()
                         );
                         
-                        // 2. Успешная обработка → коммитим offset
-                        // 👇 КОММИТ ТОЛЬКО ПОСЛЕ УСПЕШНОЙ ОБРАБОТКИ
+                        // ✅ Успешная обработка → коммитим offset
                         consumer.commitSync();
                         count++;
                         
                         System.out.printf("[%s] ✅ COMMITTED: offset=%d%n", consumerName, record.offset());
                         
                     } catch (Exception e) {
-                        // ❌ ОШИБКА ОБРАБОТКИ — offset НЕ КОММИТИМ!
+                        // ❌ Ошибка обработки — offset НЕ КОММИТИМ!
                         System.err.printf("[%s] ❌ PROCESSING ERROR: offset=%d, error=%s%n",
                             consumerName, record.offset(), e.getMessage());
-                        // offset не коммитим — сообщение будет прочитано снова
                     }
                 }
             }
