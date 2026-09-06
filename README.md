@@ -1,9 +1,11 @@
 # ДЗ №2. Надёжная доставка: acks, retries, idempotent producer, manual offset commit
 
 ## Клонирование
+```bash
 git clone git@github.com:mowertii/kafka-training.git
 cd kafka-training
 git checkout feature/homework-2
+```
 ## Как запустить проект
 
 Требуется Docker и Docker Compose.
