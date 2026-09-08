@@ -33,14 +33,10 @@ git checkout feature/homework-2
 ```java
         // Настройки надежности
         props.put(ProducerConfig.ACKS_CONFIG, "all");
-        props.put(ProducerConfig.ACKS_CONFIG, "all");
         props.put(ProducerConfig.ENABLE_IDEMPOTENCE_CONFIG, "true");
         // props.put(ProducerConfig.RETRIES_CONFIG, 5); сознательно не задаём явным маленьким числом:
         // при enable.idempotence=true клиент сам выставляет retries практически без ограничения,
         // а реальным лимитом служит delivery.timeout.ms ниже.
-        props.put(ProducerConfig.MAX_IN_FLIGHT_REQUESTS_PER_CONNECTION, 5);
-        props.put(ProducerConfig.DELIVERY_TIMEOUT_MS_CONFIG, 120000);        
-        props.put(ProducerConfig.ENABLE_IDEMPOTENCE_CONFIG, "true");
         props.put(ProducerConfig.MAX_IN_FLIGHT_REQUESTS_PER_CONNECTION, 5);
         props.put(ProducerConfig.DELIVERY_TIMEOUT_MS_CONFIG, 120000);
 ```
