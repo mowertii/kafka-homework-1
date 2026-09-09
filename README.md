@@ -10,7 +10,7 @@
 |---|----------|-------|--------|
 | 1 | Basic Producer/Consumer | [feature/homework-1](https://github.com/mowertii/kafka-training/tree/feature/homework-1) | ✅ Готово |
 | 2 | Reliable Delivery | [feature/homework-2](https://github.com/mowertii/kafka-training/tree/feature/homework-2) | ✅ Готово |
-| 3 | ... | ... | ... |
+| 3 | Error Handling: Retry, DLT, Backoff | [feature/homework-3](https://github.com/mowertii/kafka-training/tree/feature/homework-3) | ✅ Готово |
 
 ---
 
