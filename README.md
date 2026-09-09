@@ -1,11 +1,9 @@
 # ДЗ №2. Надёжная доставка: acks, retries, idempotent producer, manual offset commit
 
 ## Клонирование
-```bash
 git clone git@github.com:mowertii/kafka-training.git
 cd kafka-training
 git checkout feature/homework-2
-```
 ## Как запустить проект
 
 Требуется Docker и Docker Compose.
@@ -33,18 +31,14 @@ git checkout feature/homework-2
 Класс `TrainingApp`, метод `runProducerSafe()`. Настройки:
 
 ```java
-        // Настройки надежности
-        props.put(ProducerConfig.ACKS_CONFIG, "all");
-        props.put(ProducerConfig.ACKS_CONFIG, "all");
-        props.put(ProducerConfig.ENABLE_IDEMPOTENCE_CONFIG, "true");
-        // props.put(ProducerConfig.RETRIES_CONFIG, 5); сознательно не задаём явным маленьким числом:
-        // при enable.idempotence=true клиент сам выставляет retries практически без ограничения,
-        // а реальным лимитом служит delivery.timeout.ms ниже.
-        props.put(ProducerConfig.MAX_IN_FLIGHT_REQUESTS_PER_CONNECTION, 5);
-        props.put(ProducerConfig.DELIVERY_TIMEOUT_MS_CONFIG, 120000);        
-        props.put(ProducerConfig.ENABLE_IDEMPOTENCE_CONFIG, "true");
-        props.put(ProducerConfig.MAX_IN_FLIGHT_REQUESTS_PER_CONNECTION, 5);
-        props.put(ProducerConfig.DELIVERY_TIMEOUT_MS_CONFIG, 120000);
+         // Настройки надежности
+         props.put(ProducerConfig.ACKS_CONFIG, "all");
+         props.put(ProducerConfig.ENABLE_IDEMPOTENCE_CONFIG, "true");
+         // props.put(ProducerConfig.RETRIES_CONFIG, 5); сознательно не задаём явным маленьким числом:
+         // при enable.idempotence=true клиент сам выставляет retries практически без ограничения,
+         // а реальным лимитом служит delivery.timeout.ms ниже.
+         props.put(ProducerConfig.MAX_IN_FLIGHT_REQUESTS_PER_CONNECTION, 5);
+         props.put(ProducerConfig.DELIVERY_TIMEOUT_MS_CONFIG, 120000);
 ```
 
 Отправляется 10 сообщений (`for (int i = 1; i <= 10; i++)`), для каждого в лог выводятся key, partition, offset и результат отправки:
