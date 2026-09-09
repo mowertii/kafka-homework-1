@@ -9,7 +9,7 @@ import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.header.internals.RecordHeader;
 import org.apache.kafka.common.serialization.StringDeserializer;
 import org.apache.kafka.common.serialization.StringSerializer;
-
+import org.apache.kafka.common.header.Header;
 import java.nio.charset.StandardCharsets;
 import java.sql.*;
 import java.time.Duration;
@@ -48,13 +48,14 @@ public class TrainingApp {
             case "consumer" -> runConsumer(args);        // Потребитель
             case "producer-safe" -> runProducerSafe();   // продюсер с настройками надежности
             case "consumer-safe" -> runConsumerSafe(args); // консьюмер с ручным коммитом 
+            case "consumer-retry" -> runConsumerWithRetry(args); // консьюмер с повторным чтением
             case "all" -> { /* ... */ }
             default -> { System.err.println("Unknown mode: " + args[0]); help(); System.exit(2); }
         }
     }
 
     private static void help() {
-        System.out.println("Modes: init, basic-entities, partition-order, consumer-groups, event-styles, outbox, inbox, cqrs-saga, retry-dlt, contract, bad-shared-group, good-separate-groups, bad-universal-topic, audit-replay, producer, consumer, producer-safe, consumer-safe, all");
+        System.out.println("Modes: init, basic-entities, partition-order, consumer-groups, event-styles, outbox, inbox, cqrs-saga, retry-dlt, contract, bad-shared-group, good-separate-groups, bad-universal-topic, audit-replay, producer, consumer, producer-safe, consumer-safe, consumer-retry, all");
     }
 
     private static void init() throws Exception {
@@ -77,7 +78,7 @@ public class TrainingApp {
     }
 
     private static void basicEntities() throws Exception {
-        banner("SLIDE 7 — broker/topic/partition/producer/consumer/group");
+        banner("SLIDE 7 - broker/topic/partition/producer/consumer/group");
         String topic = "orders.events";
         try (KafkaProducer<String, String> p = producer()) {
             for (int i = 1; i <= 6; i++) {
@@ -92,7 +93,7 @@ public class TrainingApp {
     }
 
     private static void partitionOrder() throws Exception {
-        banner("SLIDE 8 — key controls partition and per-entity ordering");
+        banner("SLIDE 8 - key controls partition and per-entity ordering");
         String topic = "orders.events";
         try (KafkaProducer<String, String> p = producer()) {
             List<String> sequence = List.of("Created", "Paid", "Packed", "Shipped");
@@ -105,7 +106,7 @@ public class TrainingApp {
     }
 
     private static void consumerGroups() throws Exception {
-        banner("SLIDE 9 — one group scales one business function; another group reads independently");
+        banner("SLIDE 9 - one group scales one business function; another group reads independently");
         try (KafkaProducer<String, String> p = producer()) {
             for (int i = 0; i < 9; i++) send(p, "orders.events", "order-" + i, event("OrderPaid", "order-" + i, Map.of("amount", 10 + i)));
         }
@@ -120,7 +121,7 @@ public class TrainingApp {
     }
 
     private static void eventStyles() throws Exception {
-        banner("SLIDE 12 — notification vs event-carried state transfer");
+        banner("SLIDE 12 - notification vs event-carried state transfer");
         try (KafkaProducer<String, String> p = producer()) {
             send(p, "orders.notifications", "order-777", event("OrderPaid", "order-777", Map.of("note", "only fact + id")));
             send(p, "orders.state", "customer-19", event("CustomerChanged", "customer-19", Map.of("name", "ACME", "segment", "B2B", "status", "ACTIVE", "version", 5)));
@@ -131,7 +132,7 @@ public class TrainingApp {
     }
 
     private static void outbox() throws Exception {
-        banner("SLIDE 13 — Transactional Outbox removes dual-write hole");
+        banner("SLIDE 13 - Transactional Outbox removes dual-write hole");
         try (Connection c = db()) {
             st(c, "delete from outbox"); st(c, "delete from orders where id='order-outbox-1'");
             c.setAutoCommit(false); // НАЧИНАЕМ ТРАНЗАКЦИЮ
@@ -154,7 +155,7 @@ public class TrainingApp {
     }
 
     private static void inbox() throws Exception {
-        banner("SLIDE 14 — Inbox/idempotent consumer makes duplicate delivery harmless");
+        banner("SLIDE 14 - Inbox/idempotent consumer makes duplicate delivery harmless");
         String eventId = UUID.randomUUID().toString();
         try (Connection c = db()) { st(c, "delete from inbox"); st(c, "delete from billing_payments where order_id='order-inbox-1'"); }
         try (KafkaProducer<String, String> p = producer()) {
@@ -170,7 +171,7 @@ public class TrainingApp {
     }
 
     private static void cqrsSaga() throws Exception {
-        banner("SLIDE 15 — CQRS projection plus choreography-style saga");
+        banner("SLIDE 15 - CQRS projection plus choreography-style saga");
         try (Connection c = db()) { st(c, "delete from order_projection where order_id='saga-42'"); }
         try (KafkaProducer<String, String> p = producer()) {
             // 1. Заказ создан
@@ -192,16 +193,16 @@ public class TrainingApp {
     }
     // Retry Topic
     private static void retryDlt() throws Exception {
-        banner("SLIDE 16 — bounded retry topics and DLT with reason");
+        banner("SLIDE 16 - bounded retry topics and DLT with reason");
         // Отправляем 4 сообщения с разными сценариями
         try (KafkaProducer<String, String> p = producer()) {
-            // 1. OK — обработается сразу
+            // 1. OK - обработается сразу
             send(p, "orders.events", "ok-1", event("OrderPaid", "ok-1", Map.of("case", "ok")));
-            // 2. Временная ошибка — перейдет в retry.1
+            // 2. Временная ошибка - перейдет в retry.1
             send(p, "orders.events", "temp-1", event("OrderPaid", "temp-1", Map.of("case", "temporary")));
-            // 3. Долгая временная ошибка — перейдет в retry.2
+            // 3. Долгая временная ошибка - перейдет в retry.2
             send(p, "orders.events", "slow-1", event("OrderPaid", "slow-1", Map.of("case", "temporary-long")));
-            // 4. Фатальная ошибка — сразу в DLT
+            // 4. Фатальная ошибка - сразу в DLT
             send(p, "orders.events", "bad-1", event("OrderPaid", "bad-1", Map.of("case", "poison", "schema", "invalid business field")));
         }
         // Обработка с 3 уровнями retry
@@ -214,7 +215,7 @@ public class TrainingApp {
     }
 
     private static void contractEvolution() throws Exception {
-        banner("SLIDE 17 — event contract and schema compatibility");
+        banner("SLIDE 17 - event contract and schema compatibility");
         String v1 = "{\"eventId\":\"%s\",\"eventType\":\"CustomerChanged\",\"eventVersion\":1,\"occurredAt\":\"%s\",\"payload\":{\"customerId\":\"c-1\",\"name\":\"ACME\"}}".formatted(UUID.randomUUID(), Instant.now());
         String v2Compatible = "{\"eventId\":\"%s\",\"eventType\":\"CustomerChanged\",\"eventVersion\":2,\"occurredAt\":\"%s\",\"payload\":{\"customerId\":\"c-1\",\"name\":\"ACME\",\"segment\":\"B2B\"}}".formatted(UUID.randomUUID(), Instant.now());
         String v3Breaking = "{\"eventId\":\"%s\",\"eventType\":\"CustomerChanged\",\"eventVersion\":3,\"occurredAt\":\"%s\",\"payload\":{\"id\":\"c-1\",\"fullName\":\"ACME Ltd\"}}".formatted(UUID.randomUUID(), Instant.now());
@@ -223,7 +224,7 @@ public class TrainingApp {
     }
 
     private static void badSharedGroup() throws Exception {
-        banner("SLIDES 18–19 anti-pattern — shared consumer group for different business functions");
+        banner("SLIDES 18–19 anti-pattern - shared consumer group for different business functions");
         try (KafkaProducer<String, String> p = producer()) {
             for (int i=0;i<6;i++) send(p, "orders.events", "bad-sg-"+i, event("OrderPaid", "bad-sg-"+i, Map.of("amount", i)));
         }
@@ -236,7 +237,7 @@ public class TrainingApp {
     }
 
     private static void goodSeparateGroups() throws Exception {
-        banner("SLIDE 24 refactor — separate consumer group per business function");
+        banner("SLIDE 24 refactor - separate consumer group per business function");
         try (KafkaProducer<String, String> p = producer()) {
             for (int i=0;i<4;i++) send(p, "orders.events", "good-g-"+i, event("OrderPaid", "good-g-"+i, Map.of("amount", i)));
         }
@@ -249,7 +250,7 @@ public class TrainingApp {
     }
 
     private static void badUniversalTopic() throws Exception {
-        banner("SLIDE 18 anti-pattern — one universal topic");
+        banner("SLIDE 18 anti-pattern - one universal topic");
         try (KafkaProducer<String, String> p = producer()) {
             send(p, "all.events", "order-1", event("OrderPaid", "order-1", Map.of("amount", 100)));
             send(p, "all.events", "customer-1", event("CustomerBlocked", "customer-1", Map.of("reason", "AML")));
@@ -260,7 +261,7 @@ public class TrainingApp {
     }
 
     private static void auditReplay() throws Exception {
-        banner("SLIDE 20 / 25 — audit log and replay into a projection");
+        banner("SLIDE 20 / 25 - audit log and replay into a projection");
         // 1. Очищаем проекцию
         try (Connection c = db()) { st(c, "delete from order_projection where order_id like 'replay-%'"); }
         // 2. Отправляем события в топик audit.events
@@ -269,11 +270,11 @@ public class TrainingApp {
             send(p, "audit.events", "replay-1", event("OrderPaid", "replay-1", Map.of("amount", 10)));
             send(p, "audit.events", "replay-2", event("OrderCreated", "replay-2", Map.of("amount", 20)));
         }
-        // 3. ВЕРСИЯ 1 — строим проекцию (может быть с багом)
+        // 3. ВЕРСИЯ 1 - строим проекцию (может быть с багом)
         projectFromTopic("audit.events", "audit-replay-v1", 3);
         queryProjection("replay-1");
         log("Now pretend read-model code was fixed. Use a NEW group to replay same retained log:");
-        // 4. ВЕРСИЯ 2 — снова строим проекцию с НОВОЙ группой
+        // 4. ВЕРСИЯ 2 - снова строим проекцию с НОВОЙ группой
         // Новая группа = перечитываем все события с начала!
         projectFromTopic("audit.events", "audit-replay-v2", 3);
         queryProjection("replay-2");
@@ -293,7 +294,7 @@ public class TrainingApp {
      * - Не нужно дублировать код!
      */
     private static void runProducer() throws Exception {
-        banner("PRODUCER — отправка сообщений в топик orders");
+        banner("PRODUCER - отправка сообщений в топик orders");
         
         String topic = "orders.events"; // Имя топика согласно ТЗ
         
@@ -372,7 +373,7 @@ public class TrainingApp {
         String consumerName = args.length > 1 ? args[1] : "consumer-1";
         String groupId = args.length > 2 ? args[2] : "order-group-1";
         
-        banner("CONSUMER — name=" + consumerName + ", group=" + groupId);
+        banner("CONSUMER - name=" + consumerName + ", group=" + groupId);
         
         String topic = "orders.events";
         Properties props = new Properties();
@@ -410,9 +411,9 @@ public class TrainingApp {
      * Режим PRODUCER с настройками надежности для ДЗ №2
      * 
      * Настройки надежности:
-     * - acks=all — подтверждение от всех реплик в ISR
-     * - retries=5 — повторные попытки при ошибках
-     * - enable.idempotence=true — защита от дублей
+     * - acks=all - подтверждение от всех реплик в ISR
+     * - retries=5 - повторные попытки при ошибках
+     * - enable.idempotence=true - защита от дублей
      * 
      * Зачем:
      * - acks=all: гарантирует, что сообщение не потеряется при падении брокера
@@ -420,7 +421,7 @@ public class TrainingApp {
      * - idempotence: Producer не создаст дубли даже при повторных отправках
      */
     private static void runProducerSafe() throws Exception {
-        banner("PRODUCER SAFE — надежная доставка с acks=all, retries, idempotence");
+        banner("PRODUCER SAFE - надежная доставка с acks=all, retries, idempotence");
         
         String topic = "orders.events";
         
@@ -431,14 +432,10 @@ public class TrainingApp {
         
         // Настройки надежности
         props.put(ProducerConfig.ACKS_CONFIG, "all");
-        props.put(ProducerConfig.ACKS_CONFIG, "all");
         props.put(ProducerConfig.ENABLE_IDEMPOTENCE_CONFIG, "true");
         // props.put(ProducerConfig.RETRIES_CONFIG, 5); сознательно не задаём явным маленьким числом:
         // при enable.idempotence=true клиент сам выставляет retries практически без ограничения,
         // а реальным лимитом служит delivery.timeout.ms ниже.
-        props.put(ProducerConfig.MAX_IN_FLIGHT_REQUESTS_PER_CONNECTION, 5);
-        props.put(ProducerConfig.DELIVERY_TIMEOUT_MS_CONFIG, 120000);        
-        props.put(ProducerConfig.ENABLE_IDEMPOTENCE_CONFIG, "true");
         props.put(ProducerConfig.MAX_IN_FLIGHT_REQUESTS_PER_CONNECTION, 5);
         props.put(ProducerConfig.DELIVERY_TIMEOUT_MS_CONFIG, 120000);
         
@@ -479,9 +476,9 @@ public class TrainingApp {
     /**
      * Режим CONSUMER SAFE для ДЗ №2
      * Настройки:
-     * - enable.auto.commit=false — ручной контроль offset
+     * - enable.auto.commit=false - ручной контроль offset
      * - commitSync() только после успешной обработки
-     * - auto.offset.reset=earliest — читаем с начала
+     * - auto.offset.reset=earliest - читаем с начала
      * 
      * Аргументы командной строки:
      * - args[1]: имя consumer
@@ -494,7 +491,7 @@ public class TrainingApp {
         String consumerName = args.length > 1 ? args[1] : "consumer-safe-1";
         String groupId = args.length > 2 ? args[2] : "consumer-safe-group";
         
-        banner("CONSUMER SAFE — name=" + consumerName + ", group=" + groupId);
+        banner("CONSUMER SAFE - name=" + consumerName + ", group=" + groupId);
         
         String topic = "orders.events";
         
@@ -551,7 +548,7 @@ public class TrainingApp {
                         System.out.printf("[%s] ✅ COMMITTED: offset=%d%n", consumerName, record.offset());
                         
                     } catch (Exception e) {
-                        // ❌ Ошибка обработки — offset НЕ КОММИТИМ!
+                        // ❌ Ошибка обработки - offset НЕ КОММИТИМ!
                         System.err.printf("[%s] ❌ PROCESSING ERROR: offset=%d, error=%s%n",
                             consumerName, record.offset(), e.getMessage());
                     }
@@ -561,6 +558,157 @@ public class TrainingApp {
             log("Consumer '" + consumerName + "' завершил работу. Обработано сообщений: " + count);
         }
     }
+    /**
+     * Режим CONSUMER с обработкой ошибок через Retry и DLT для ДЗ №3
+     * 
+     * Использование:
+     * consumer-retry consumer-name consumer-group topic
+     * 
+     * Примеры:
+     * consumer-retry consumer-main consumer-retry-group orders.events
+     * consumer-retry consumer-retry-1 consumer-retry-group orders.retry.1
+     * consumer-retry consumer-retry-2 consumer-retry-group orders.retry.2
+     */
+    private static void runConsumerWithRetry(String[] args) throws Exception {
+        String consumerName = args.length > 1 ? args[1] : "consumer-retry-1";
+        String groupId = args.length > 2 ? args[2] : "consumer-retry-group";
+        String sourceTopic = args.length > 3 ? args[3] : "orders.events";
+        
+        banner("CONSUMER RETRY - name=" + consumerName + ", group=" + groupId + ", topic=" + sourceTopic);
+        
+        Properties props = new Properties();
+        props.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, BOOTSTRAP);
+        props.put(ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class.getName());
+        props.put(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class.getName());
+        props.put(ConsumerConfig.GROUP_ID_CONFIG, groupId);
+        props.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest");
+        props.put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, "false");
+        
+        // Определяем уровень retry и целевой топик
+        int retryLevel = 0;
+        String targetTopic = "orders.retry.1";
+        if (sourceTopic.equals("orders.retry.1")) {
+            retryLevel = 1;
+            targetTopic = "orders.retry.2";
+        } else if (sourceTopic.equals("orders.retry.2")) {
+            retryLevel = 2;
+            targetTopic = "orders.dlt";
+        } else if (sourceTopic.equals("orders.dlt")) {
+            retryLevel = 3;
+            targetTopic = "orders.dlt";
+        }
+        
+        int backoffMs = retryLevel == 0 ? 0 : retryLevel * 3000; // 0s, 3s, 6s
+        
+        try (KafkaConsumer<String, String> consumer = new KafkaConsumer<>(props);
+            // 👇 ИСПРАВЛЕНО: создаем Producer отдельно
+            KafkaProducer<String, String> producer = new KafkaProducer<>(producerProps())) {
+            
+            consumer.subscribe(List.of(sourceTopic));
+            
+            log("Подписались на топик: " + sourceTopic);
+            log("Уровень retry: " + retryLevel + ", backoff: " + backoffMs + "ms");
+            log("При ошибке отправляем в: " + targetTopic);
+            
+            int count = 0;
+            long until = System.currentTimeMillis() + 30000;
+            
+            while (System.currentTimeMillis() < until) {
+                ConsumerRecords<String, String> records = consumer.poll(Duration.ofMillis(1000));
+                
+                if (records.isEmpty()) {
+                    continue;
+                }
+                
+                for (ConsumerRecord<String, String> record : records) {
+                    try {
+                        JsonNode json = JSON.readTree(record.value());
+                        JsonNode payload = json.path("payload");
+                        
+                        int orderId = payload.path("orderId").asInt();
+                        int userId = payload.path("userId").asInt();
+                        
+                        // 👇 ИСКУССТВЕННАЯ ОШИБКА ДЛЯ ORDER_ID = 5
+                        if (orderId == 5) {
+                            throw new RuntimeException("Искусственная ошибка для orderId=5 (тестируем Retry/DLT)");
+                        }
+                        
+                        // ✅ УСПЕШНАЯ ОБРАБОТКА
+                        System.out.printf("[%s] ✅ SUCCESS: key=%s, partition=%d, offset=%d, orderId=%d, userId=%d, product=%s%n",
+                            consumerName,
+                            record.key(),
+                            record.partition(),
+                            record.offset(),
+                            orderId,
+                            userId,
+                            payload.path("product").asText("unknown")
+                        );
+                        
+                        consumer.commitSync();
+                        count++;
+                        
+                    } catch (Exception e) {
+                        // ❌ ОШИБКА - отправляем в retry или DLT
+                        int orderId = 0;
+                        try {
+                            JsonNode json = JSON.readTree(record.value());
+                            // 👇 ИСПРАВЛЕНО: переменная payload объявлена здесь
+                            JsonNode payload = json.path("payload");
+                            orderId = payload.path("orderId").asInt();
+                        } catch (Exception ignore) {}
+                        
+                        System.err.printf("[%s] ❌ ERROR: orderId=%d, error=%s%n",
+                            consumerName, orderId, e.getMessage());
+                        
+                        // Проверяем, есть ли уже заголовок с номером попытки
+                        int attempt = 1;
+                        Iterable<Header> headers = record.headers().headers("x-attempt");
+                        if (headers.iterator().hasNext()) {
+                            attempt = Integer.parseInt(new String(headers.iterator().next().value())) + 1;
+                        }
+                        
+                        System.out.printf("[%s] 🔄 Попытка #%d, отправляем в %s%n",
+                            consumerName, attempt, targetTopic);
+                        
+                        // Добавляем заголовки с информацией об ошибке
+                        ProducerRecord<String, String> retryRecord = new ProducerRecord<>(
+                            targetTopic,
+                            record.key(),
+                            record.value()
+                        );
+                        retryRecord.headers().add("x-attempt", String.valueOf(attempt).getBytes());
+                        retryRecord.headers().add("x-original-topic", sourceTopic.getBytes());
+                        retryRecord.headers().add("x-error", e.getMessage().getBytes());
+                        retryRecord.headers().add("x-error-time", Instant.now().toString().getBytes());
+                        
+                        // Отправляем в retry/DLT с задержкой (backoff)
+                        Thread.sleep(backoffMs);
+                        producer.send(retryRecord).get();
+                        
+                        // Коммитим offset, чтобы не читать это сообщение снова
+                        consumer.commitSync();
+                    }
+                }
+            }
+            
+            log("Consumer '" + consumerName + "' завершил работу. Обработано: " + count);
+        }
+    }
+
+    /**
+     * Создает свойства для Producer (используется в consumer-retry)
+     */
+    private static Properties producerProps() {
+        Properties props = new Properties();
+        props.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, BOOTSTRAP);
+        props.put(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, StringSerializer.class.getName());
+        props.put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, StringSerializer.class.getName());
+        props.put(ProducerConfig.ACKS_CONFIG, "all");
+        props.put(ProducerConfig.ENABLE_IDEMPOTENCE_CONFIG, "true");
+        props.put(ProducerConfig.RETRIES_CONFIG, 5);
+        return props;
+    }
+
     // ---------- Kafka helpers ----------
     private static KafkaProducer<String, String> producer() {
         Properties p = new Properties();
@@ -748,7 +896,7 @@ public class TrainingApp {
     private static void projectOrders(int expected) throws Exception { projectFromTopic("orders.events", "orders-readmodel-demo", expected); }
     private static void projectFromTopic(String topic, String group, int expected) throws Exception {
         // Создаем Consumer с указанной группой
-        // ВАЖНО: Если группа новая — читаем с начала (auto.offset.reset=earliest)
+        // ВАЖНО: Если группа новая - читаем с начала (auto.offset.reset=earliest)
         try (KafkaConsumer<String,String> c = consumer(group)) {
             c.subscribe(List.of(topic));
             int count=0; long until = System.currentTimeMillis()+8000;
@@ -763,7 +911,7 @@ public class TrainingApp {
                     String status = switch (type) { case "OrderCreated" -> "CREATED"; case "OrderPaid" -> "PAID"; case "OrderConfirmed" -> "CONFIRMED"; default -> type; };
                     int amount = e.path("payload").path("amount").asInt(0);
                     // 👇 БИЗНЕС-ЛОГИКА: обновляем Read Model
-                    // Если здесь был баг — его исправляют в новой версии кода
+                    // Если здесь был баг - его исправляют в новой версии кода
                     try (Connection db = db(); PreparedStatement ps = db.prepareStatement("insert into order_projection(order_id,status,amount,last_event_id) values(?,?,?,?) on conflict(order_id) do update set status=excluded.status, amount=greatest(order_projection.amount, excluded.amount), last_event_id=excluded.last_event_id, updated_at=now()")) {
                         ps.setString(1, orderId); ps.setString(2, status); ps.setInt(3, amount); ps.setString(4, e.path("eventId").asText()); ps.executeUpdate();
                     }
@@ -793,7 +941,7 @@ public class TrainingApp {
                     if ("ok".equals(kase) || ("temporary".equals(kase) && attempt >= 2) || ("temporary-long".equals(kase) && attempt >= 3)) {
                         // ✅ Успех!
                         log("processed ok after attempt=%d key=%s case=%s".formatted(attempt, r.key(), kase));
-                    // ❌ Ошибка — отправляем дальше по цепочке
+                    // ❌ Ошибка - отправляем дальше по цепочке
                     } else {
                         String target = "poison".equals(kase) ? dltTopic : nextTopic;
                         // Копируем сообщение в новый топик
