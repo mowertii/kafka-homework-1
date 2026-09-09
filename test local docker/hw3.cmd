@@ -42,7 +42,9 @@ echo ============================================================
 echo HOMEWORK 3 COMPLETED!
 echo ============================================================
 echo.
-echo Check DLT:
+echo Check DLT for Linux:
 echo   docker exec -it kafka-training-broker /opt/kafka/bin/kafka-console-consumer.sh --bootstrap-server localhost:19092 --topic orders.dlt --from-beginning --property print.key=true --max-messages 10
-
+echo.
+echo Check DLT for Windows:
+echo   docker exec -it kafka-training-broker //opt/kafka/bin/kafka-console-consumer.sh --bootstrap-server localhost:19092 --topic orders.dlt --from-beginning --property print.key=true --property print.headers=true --max-messages 1
 exit /b %errorlevel%

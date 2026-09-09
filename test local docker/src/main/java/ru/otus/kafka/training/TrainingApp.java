@@ -584,7 +584,9 @@ public class TrainingApp {
         props.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest");
         props.put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, "false");
         
-        // Определяем уровень retry и целевой топик
+        // ============================================================
+        // 🎯 ОПРЕДЕЛЯЕМ УРОВЕНЬ RETRY И ЦЕЛЕВОЙ ТОПИК
+        // ============================================================
         int retryLevel = 0;
         String targetTopic = "orders.retry.1";
         if (sourceTopic.equals("orders.retry.1")) {
@@ -595,20 +597,23 @@ public class TrainingApp {
             targetTopic = "orders.dlt";
         } else if (sourceTopic.equals("orders.dlt")) {
             retryLevel = 3;
-            targetTopic = "orders.dlt";
+            targetTopic = null; // ВАЖНО: не отправляем дальше!
         }
         
         int backoffMs = retryLevel == 0 ? 0 : retryLevel * 3000; // 0s, 3s, 6s
         
         try (KafkaConsumer<String, String> consumer = new KafkaConsumer<>(props);
-            // 👇 ИСПРАВЛЕНО: создаем Producer отдельно
-            KafkaProducer<String, String> producer = new KafkaProducer<>(producerProps())) {
+             KafkaProducer<String, String> producer = new KafkaProducer<>(producerProps())) {
             
             consumer.subscribe(List.of(sourceTopic));
             
             log("Подписались на топик: " + sourceTopic);
             log("Уровень retry: " + retryLevel + ", backoff: " + backoffMs + "ms");
-            log("При ошибке отправляем в: " + targetTopic);
+            if (targetTopic != null) {
+                log("При ошибке отправляем в: " + targetTopic);
+            } else {
+                log("⚠️ Это DLT-консьюмер. Сообщения только читаем, дальше не отправляем!");
+            }
             
             int count = 0;
             long until = System.currentTimeMillis() + 30000;
@@ -628,70 +633,95 @@ public class TrainingApp {
                         int orderId = payload.path("orderId").asInt();
                         int userId = payload.path("userId").asInt();
                         
-                        // 👇 ИСКУССТВЕННАЯ ОШИБКА ДЛЯ ORDER_ID = 5
+                        // ============================================================
+                        // 🎯 ИСКУССТВЕННАЯ ОШИБКА ДЛЯ orderId = 5
+                        // ============================================================
                         if (orderId == 5) {
                             throw new RuntimeException("Искусственная ошибка для orderId=5 (тестируем Retry/DLT)");
                         }
                         
+                        // ============================================================
                         // ✅ УСПЕШНАЯ ОБРАБОТКА
-                        System.out.printf("[%s] ✅ SUCCESS: key=%s, partition=%d, offset=%d, orderId=%d, userId=%d, product=%s%n",
+                        // ============================================================
+                        int attempt = 0;
+                        Iterable<Header> attemptHeaders = record.headers().headers("x-attempt");
+                        if (attemptHeaders.iterator().hasNext()) {
+                            attempt = Integer.parseInt(new String(attemptHeaders.iterator().next().value()));
+                        }
+                        
+                        System.out.printf("[%s] ✅ УСПЕШНО: key=%s, partition=%d, offset=%d, orderId=%d, userId=%d, product=%s, попытка=%d%n",
                             consumerName,
                             record.key(),
                             record.partition(),
                             record.offset(),
                             orderId,
                             userId,
-                            payload.path("product").asText("unknown")
+                            payload.path("product").asText("unknown"),
+                            attempt
                         );
                         
                         consumer.commitSync();
                         count++;
                         
                     } catch (Exception e) {
-                        // ❌ ОШИБКА - отправляем в retry или DLT
+                        // ============================================================
+                        // ❌ ОШИБКА
+                        // ============================================================
                         int orderId = 0;
                         try {
                             JsonNode json = JSON.readTree(record.value());
-                            // 👇 ИСПРАВЛЕНО: переменная payload объявлена здесь
                             JsonNode payload = json.path("payload");
                             orderId = payload.path("orderId").asInt();
                         } catch (Exception ignore) {}
                         
-                        System.err.printf("[%s] ❌ ERROR: orderId=%d, error=%s%n",
-                            consumerName, orderId, e.getMessage());
-                        
-                        // Проверяем, есть ли уже заголовок с номером попытки
                         int attempt = 1;
                         Iterable<Header> headers = record.headers().headers("x-attempt");
                         if (headers.iterator().hasNext()) {
                             attempt = Integer.parseInt(new String(headers.iterator().next().value())) + 1;
                         }
                         
-                        System.out.printf("[%s] 🔄 Попытка #%d, отправляем в %s%n",
-                            consumerName, attempt, targetTopic);
+                        System.err.printf("[%s] ❌ ОШИБКА: orderId=%d, попытка=%d, ошибка=%s%n",
+                            consumerName, orderId, attempt, e.getMessage());
                         
-                        // Добавляем заголовки с информацией об ошибке
-                        ProducerRecord<String, String> retryRecord = new ProducerRecord<>(
-                            targetTopic,
-                            record.key(),
-                            record.value()
-                        );
-                        retryRecord.headers().add("x-attempt", String.valueOf(attempt).getBytes());
-                        retryRecord.headers().add("x-original-topic", sourceTopic.getBytes());
-                        retryRecord.headers().add("x-error", e.getMessage().getBytes());
-                        retryRecord.headers().add("x-error-time", Instant.now().toString().getBytes());
+                        // ============================================================
+                        // 🎯 ЕСЛИ targetTopic != null → ОТПРАВЛЯЕМ ДАЛЬШЕ
+                        // ============================================================
+                        if (targetTopic != null) {
+                            System.out.printf("[%s] 🔄 RETRY: orderId=%d, попытка=%d → отправляем в %s (backoff %dms)%n",
+                                consumerName, orderId, attempt, targetTopic, backoffMs);
+                            
+                            ProducerRecord<String, String> retryRecord = new ProducerRecord<>(
+                                targetTopic,
+                                record.key(),
+                                record.value()
+                            );
+                            retryRecord.headers().add("x-attempt", String.valueOf(attempt).getBytes());
+                            retryRecord.headers().add("x-original-topic", sourceTopic.getBytes());
+                            retryRecord.headers().add("x-error", e.getMessage().getBytes());
+                            retryRecord.headers().add("x-error-time", Instant.now().toString().getBytes());
+                            retryRecord.headers().add("x-retry-count", String.valueOf(attempt).getBytes());
+                            
+                            try {
+                                Thread.sleep(backoffMs);
+                            } catch (InterruptedException ie) {
+                                Thread.currentThread().interrupt();
+                            }
+                            producer.send(retryRecord).get();
+                            
+                        } else {
+                            // ============================================================
+                            // 💀 targetTopic == null → ЭТО DLT
+                            // ============================================================
+                            System.out.printf("[%s] 💀 DLT: orderId=%d, попытка=%d (все попытки исчерпаны, сообщение отправлено в orders.dlt)%n",
+                                consumerName, orderId, attempt);
+                        }
                         
-                        // Отправляем в retry/DLT с задержкой (backoff)
-                        Thread.sleep(backoffMs);
-                        producer.send(retryRecord).get();
-                        
-                        // Коммитим offset, чтобы не читать это сообщение снова
                         consumer.commitSync();
                     }
                 }
             }
             
-            log("Consumer '" + consumerName + "' завершил работу. Обработано: " + count);
+            log("Consumer '" + consumerName + "' завершил работу. Обработано успешно: " + count);
         }
     }
 
