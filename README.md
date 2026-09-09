@@ -29,3 +29,5 @@ git checkout feature/homework-1
 ./start.cmd
 ./demo.cmd init
 ./demo.cmd producer
+или одним файлом (если есть)
+hw2.cmd, hw3.cmd etc
