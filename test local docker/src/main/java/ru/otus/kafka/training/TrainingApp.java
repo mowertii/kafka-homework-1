@@ -49,13 +49,15 @@ public class TrainingApp {
             case "producer-safe" -> runProducerSafe();   // продюсер с настройками надежности
             case "consumer-safe" -> runConsumerSafe(args); // консьюмер с ручным коммитом 
             case "consumer-retry" -> runConsumerWithRetry(args); // консьюмер с повторным чтением
+            case "producer-dup" -> runProducerWithDuplicates();
+            case "consumer-idempotent" -> runConsumerIdempotent(args);
             case "all" -> { /* ... */ }
             default -> { System.err.println("Unknown mode: " + args[0]); help(); System.exit(2); }
         }
     }
 
     private static void help() {
-        System.out.println("Modes: init, basic-entities, partition-order, consumer-groups, event-styles, outbox, inbox, cqrs-saga, retry-dlt, contract, bad-shared-group, good-separate-groups, bad-universal-topic, audit-replay, producer, consumer, producer-safe, consumer-safe, consumer-retry, all");
+        System.out.println("Modes: init, basic-entities, partition-order, consumer-groups, event-styles, outbox, inbox, cqrs-saga, retry-dlt, contract, bad-shared-group, good-separate-groups, bad-universal-topic, audit-replay, producer, consumer, producer-safe, consumer-safe, producer-dup, consumer-idempotent, consumer-retry, all");
     }
 
     private static void init() throws Exception {
@@ -72,7 +74,8 @@ public class TrainingApp {
             st(c, "create table if not exists inbox(event_id uuid primary key, processed_at timestamptz not null default now())");
             st(c, "create table if not exists billing_payments(order_id varchar primary key, amount int not null, created_at timestamptz not null default now())");
             st(c, "create table if not exists order_projection(order_id varchar primary key, status varchar not null, amount int not null, last_event_id varchar not null, updated_at timestamptz not null default now())");
-            st(c, "truncate table orders, outbox, inbox, billing_payments, order_projection");
+            st(c, "create table if not exists hw4_processed_orders(order_id varchar primary key, event_id uuid not null, amount int not null, processed_at timestamptz not null default now())");
+            st(c, "truncate table orders, outbox, inbox, billing_payments, order_projection, hw4_processed_orders");
         }
         log("Ready. Topics and DB tables have been reset. Run any example mode.");
     }
@@ -738,6 +741,148 @@ public class TrainingApp {
         props.put(ProducerConfig.RETRIES_CONFIG, 5);
         return props;
     }
+    /**
+     * ДЗ №4, Задание 1: Producer, который отправляет несколько уникальных событий
+     * и намеренно дублирует одно из них (тот же eventId) несколько раз подряд.
+     *
+     * Почему дубль — это именно ОДИНАКОВЫЙ eventId, а не просто "ещё одно похожее сообщение"?
+     * В реальной жизни Kafka может сама доставить одно и то же сообщение дважды, без нашего умысла:
+     * - producer не дождался ack вовремя и сделал retry, хотя брокер сообщение уже принял
+     *   (типичный случай без enable.idempotence на стороне producer);
+     * - consumer обработал сообщение, но упал/перезапустился ДО commitSync() — при перезапуске
+     *   он читает с последнего закоммиченного offset и получает то же сообщение снова.
+     * В обоих случаях eventId (если он присвоен один раз и не меняется) остаётся одинаковым —
+     * именно по нему consumer и должен опознать дубль, а не по содержимому сообщения.
+     */
+    private static void runProducerWithDuplicates() throws Exception {
+        banner("PRODUCER DUP — уникальные события + намеренный дубль по eventId");
+
+        String topic = "orders.events";
+
+        try (KafkaProducer<String, String> p = producer()) {
+            // 1. Пять обычных заказов — у каждого свой уникальный eventId
+            //    (event() сам генерирует новый UUID при каждом вызове)
+            for (int i = 1; i <= 5; i++) {
+                String aggregateId = "hw4-order-" + i;
+                String value = event("OrderCreated", aggregateId, Map.of("amount", 100 * i));
+                send(p, topic, aggregateId, value);
+            }
+
+            // 2. Одно сообщение с ФИКСИРОВАННЫМ eventId — генерируем JSON один раз,
+            //    а отправляем этот же самый payload несколько раз подряд.
+            String duplicatedEventId = UUID.randomUUID().toString();
+            String duplicatedOrderId = "hw4-order-DUP";
+            String duplicatedPayload = eventWithId(duplicatedEventId, "OrderCreated", duplicatedOrderId, Map.of("amount", 777));
+
+            log("Отправляем eventId=" + duplicatedEventId + " ТРИ раза подряд (эмулируем повторную доставку)");
+            for (int attempt = 1; attempt <= 3; attempt++) {
+                RecordMetadata md = p.send(new ProducerRecord<>(topic, duplicatedOrderId, duplicatedPayload)).get();
+                log("dup-send attempt=%d partition=%d offset=%d eventId=%s".formatted(attempt, md.partition(), md.offset(), duplicatedEventId));
+            }
+        }
+
+        log("Готово: 5 уникальных событий + 1 событие продублировано 3 раза (один и тот же eventId).");
+    }
+
+    /**
+     * ДЗ №4, Задание 2+3: идемпотентный consumer с Inbox Pattern.
+     *
+     * Бизнес-операция (запись в hw4_processed_orders) и отметка "это eventId уже обработан"
+     * (запись в inbox) выполняются в ОДНОЙ транзакции БД — если что-то из двух не запишется,
+     * откатится всё целиком, и при повторном чтении сообщения обработка честно начнётся заново.
+     *
+     * Порядок проверки: сначала select по inbox — если запись уже есть, бизнес-логику НЕ повторяем.
+     * Настоящая защита от гонки при этом — PRIMARY KEY на inbox.event_id: если бы два процесса
+     * попытались вставить один и тот же event_id параллельно, второй словил бы constraint violation.
+     * В этой демонстрации конкуренции нет: сообщения с одинаковым ключом (orderId) всегда попадают
+     * в одну и ту же партицию и обрабатываются одним consumer'ом строго последовательно — поэтому
+     * простого select-затем-insert достаточно, отдельный SELECT ... FOR UPDATE тут не добавляет
+     * реальной защиты (FOR UPDATE не блокирует ЕЩЁ НЕ СУЩЕСТВУЮЩУЮ строку).
+     *
+     * Kafka offset коммитится ПОСЛЕ завершения транзакции в БД — то есть после того, как мы точно
+     * знаем исход: либо обработали и записали, либо корректно распознали дубль и ничего не делали.
+     */
+    private static void runConsumerIdempotent(String[] args) throws Exception {
+        String consumerName = args.length > 1 ? args[1] : "consumer-idempotent-1";
+        String groupId = args.length > 2 ? args[2] : "consumer-idempotent-group";
+
+        banner("CONSUMER IDEMPOTENT — name=" + consumerName + ", group=" + groupId);
+
+        String topic = "orders.events";
+
+        Properties props = new Properties();
+        props.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, BOOTSTRAP);
+        props.put(ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class.getName());
+        props.put(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class.getName());
+        props.put(ConsumerConfig.GROUP_ID_CONFIG, groupId);
+        props.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest");
+        props.put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, "false"); // ручной коммит — только после успешной транзакции в БД
+
+        int processed = 0;
+        int duplicates = 0;
+
+        try (KafkaConsumer<String, String> consumer = new KafkaConsumer<>(props)) {
+            consumer.subscribe(List.of(topic));
+            log("Подписались на топик: " + topic);
+
+            long until = System.currentTimeMillis() + 20000;
+
+            while (System.currentTimeMillis() < until) {
+                ConsumerRecords<String, String> records = consumer.poll(Duration.ofMillis(1000));
+                if (records.isEmpty()) {
+                    log("Нет сообщений, продолжаем ждать...");
+                    continue;
+                }
+
+                for (ConsumerRecord<String, String> record : records) {
+                    JsonNode event = JSON.readTree(record.value());
+                    String eventId = event.path("eventId").asText();
+                    String orderId = event.path("aggregateId").asText();
+                    int amount = event.path("payload").path("amount").asInt(0);
+
+                    try (Connection db = db()) {
+                        db.setAutoCommit(false); // проверка дубля и бизнес-операция должны быть одной транзакцией
+
+                        boolean alreadyProcessed = exists(db, "select 1 from inbox where event_id=?::uuid", eventId);
+
+                        if (alreadyProcessed) {
+                            // ЭТО ДУБЛЬ: eventId уже встречался и обработан ранее.
+                            // Бизнес-операцию НЕ повторяем — в этом и есть идемпотентность.
+                            log("[%s] ⚠️ DUPLICATE SKIPPED: eventId=%s orderId=%s — уже обработано, пропускаем"
+                                .formatted(consumerName, eventId, orderId));
+                            duplicates++;
+                            db.commit(); // транзакция пустая, но закрываем её явно
+                        } else {
+                            try (PreparedStatement ins = db.prepareStatement(
+                                    "insert into hw4_processed_orders(order_id, event_id, amount) values (?, ?::uuid, ?) on conflict(order_id) do nothing");
+                                PreparedStatement inbox = db.prepareStatement(
+                                    "insert into inbox(event_id) values (?::uuid)")) {
+                                ins.setString(1, orderId);
+                                ins.setString(2, eventId);
+                                ins.setInt(3, amount);
+                                ins.executeUpdate();
+
+                                inbox.setString(1, eventId);
+                                inbox.executeUpdate();
+                            }
+                            db.commit(); // бизнес-операция и отметка "обработано" фиксируются атомарно
+                            processed++;
+                            log("[%s] ✅ PROCESSED: eventId=%s orderId=%s amount=%d — записано в hw4_processed_orders и inbox"
+                                .formatted(consumerName, eventId, orderId, amount));
+                        }
+                    } catch (Exception e) {
+                        log("[%s] ❌ DB ERROR: eventId=%s error=%s — offset НЕ коммитим, прочитаем это сообщение снова"
+                            .formatted(consumerName, eventId, e.getMessage()));
+                        continue; // пропускаем commitSync ниже — Kafka передаст это сообщение повторно
+                    }
+
+                    consumer.commitSync();
+                }
+            }
+
+            log("Consumer '" + consumerName + "' завершил работу. Обработано новых: " + processed + ", пропущено дублей: " + duplicates);
+        }
+    }    
 
     // ---------- Kafka helpers ----------
     private static KafkaProducer<String, String> producer() {
