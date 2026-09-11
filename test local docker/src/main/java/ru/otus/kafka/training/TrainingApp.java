@@ -19,6 +19,13 @@ import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 public class TrainingApp {
+    // ============================================================
+    // 🎯 ДЗ №5: Флаг для имитации сбоя Kafka
+    // ============================================================
+    // Когда true — producer "падает" при отправке (эмулируем недоступность брокера).
+    // Это позволяет проверить, что событие остаётся в outbox с published=false.
+    // ============================================================
+    private static final AtomicBoolean KAFKA_FAILURE_MODE = new AtomicBoolean(false);    
     private static final ObjectMapper JSON = new ObjectMapper();
     private static final String BOOTSTRAP = env("BOOTSTRAP_SERVERS", "localhost:9094");
     private static final String JDBC_URL = env("JDBC_URL", "jdbc:postgresql://localhost:5433/kafkademo");
@@ -49,15 +56,17 @@ public class TrainingApp {
             case "producer-safe" -> runProducerSafe();   // продюсер с настройками надежности
             case "consumer-safe" -> runConsumerSafe(args); // консьюмер с ручным коммитом 
             case "consumer-retry" -> runConsumerWithRetry(args); // консьюмер с повторным чтением
-            case "producer-dup" -> runProducerWithDuplicates();
-            case "consumer-idempotent" -> runConsumerIdempotent(args);
+            case "producer-dup" -> runProducerWithDuplicates(); // ДЗ №4
+            case "consumer-idempotent" -> runConsumerIdempotent(args); // ДЗ №4
+            case "outbox-fail" -> runOutboxWithFailure();     // ДЗ №5: Outbox + сбой
+            case "outbox-relay" -> runOutboxRelay();          // ДЗ №5: повторная отправка
             case "all" -> { /* ... */ }
             default -> { System.err.println("Unknown mode: " + args[0]); help(); System.exit(2); }
         }
     }
 
     private static void help() {
-        System.out.println("Modes: init, basic-entities, partition-order, consumer-groups, event-styles, outbox, inbox, cqrs-saga, retry-dlt, contract, bad-shared-group, good-separate-groups, bad-universal-topic, audit-replay, producer, consumer, producer-safe, consumer-safe, producer-dup, consumer-idempotent, consumer-retry, all");
+        System.out.println("Modes: init, basic-entities, partition-order, consumer-groups, event-styles, outbox, inbox, cqrs-saga, retry-dlt, contract, bad-shared-group, good-separate-groups, bad-universal-topic, audit-replay, producer, consumer, producer-safe, consumer-safe, producer-dup, consumer-idempotent, consumer-retry, outbox-fail, outbox-relay, all");
     }
 
     private static void init() throws Exception {
@@ -155,6 +164,222 @@ public class TrainingApp {
         relayOutboxOnce();
         consumeFixed("outbox-downstream", "orders.events", 1, Duration.ofSeconds(5));
         log("Meaning: the business transaction does not depend on broker availability; relay can repeat publish until success.");
+    }
+
+    /**
+     * ============================================================
+     * 🎯 ДЗ №5, ЗАДАНИЯ 1 и 3: Transactional Outbox + воспроизведение сбоя
+     * ============================================================
+     *
+     * Что мы демонстрируем:
+     *
+     * 1. Бизнес-операция (создание заказа) и запись события в outbox
+     *    выполняются в ОДНОЙ транзакции БД.
+     *    → Если упадёт что-то одно, откатится всё целиком.
+     *
+     * 2. Первая попытка отправки в Kafka ИСКУССТВЕННО "проваливается".
+     *    → Заказ остаётся в orders, событие — в outbox с published=false.
+     *    → Kafka НЕ получил событие.
+     *
+     * 3. Это ключевая демонстрация проблемы dual-write:
+     *    save() + producer.send() без Outbox → потеря события при сбое.
+     *
+     * Что мы получаем:
+     * ✅ Доказательство, что бизнес-транзакция не зависит от доступности Kafka.
+     * ✅ Событие НЕ потеряно, лежит в outbox и ждёт повтора.
+     * ✅ Заказ создан (БД консистентна), но downstream ещё не знает о нём.
+     * ============================================================
+     */
+    private static void runOutboxWithFailure() throws Exception {
+        banner("ДЗ №5 / ШАГ 1 - Outbox + ВОСПРОИЗВЕДЕНИЕ СБОЯ отправки в Kafka");
+
+        String orderId = "hw5-order-fail-1";
+        String eventId = UUID.randomUUID().toString();
+
+        // ------------------------------------------------------------
+        // ШАГ 1.1: Транзакция в БД — заказ + событие в outbox
+        // ------------------------------------------------------------
+        try (Connection c = db()) {
+            // Чистим предыдущие данные для повторного запуска
+            st(c, "delete from outbox where aggregate_id='" + orderId + "'");
+            st(c, "delete from orders where id='" + orderId + "'");
+
+            c.setAutoCommit(false); // НАЧИНАЕМ ТРАНЗАКЦИЮ
+
+            try (
+                PreparedStatement orderPs = c.prepareStatement(
+                    "insert into orders(id, status, amount) values (?, ?, ?)");
+                PreparedStatement outboxPs = c.prepareStatement(
+                    "insert into outbox(id, aggregate_id, event_type, payload, published) values (?::uuid, ?, ?, ?, false)")
+            ) {
+                // 1. Сохраняем заказ
+                orderPs.setString(1, orderId);
+                orderPs.setString(2, "CREATED");
+                orderPs.setInt(3, 1500);
+                orderPs.executeUpdate();
+                log("📝 [БД] orders: id=%s status=CREATED amount=1500".formatted(orderId));
+
+                // 2. Сохраняем событие в outbox (published=false)
+                String payload = eventWithId(eventId, "OrderCreated", orderId, Map.of("amount", 1500));
+                outboxPs.setString(1, eventId);
+                outboxPs.setString(2, orderId);
+                outboxPs.setString(3, "OrderCreated");
+                outboxPs.setString(4, payload);
+                outboxPs.executeUpdate();
+                log("📝 [БД] outbox: id=%s eventType=OrderCreated published=false".formatted(eventId));
+
+                c.commit(); // КОММИТИМ ТРАНЗАКЦИЮ
+                log("✅ [БД] Транзакция закоммичена: order + outbox записаны АТОМАРНО. Kafka ещё не знает.");
+            } catch (Exception e) {
+                c.rollback();
+                log("❌ [БД] Транзакция откачена: " + e.getMessage());
+                throw e;
+            }
+        }
+
+        // ------------------------------------------------------------
+        // ШАГ 1.2: Попытка отправки в Kafka → ИСКУССТВЕННЫЙ СБОЙ
+        // ------------------------------------------------------------
+        log("");
+        log("🔥 [СБОЙ] Включаем KAFKA_FAILURE_MODE=true (эмулируем недоступность брокера)");
+        KAFKA_FAILURE_MODE.set(true);
+
+        try {
+            relayOutboxOnceWithFailure(); // ← метод, который упадёт
+        } catch (Exception e) {
+            log("❌ [KAFKA] Отправка ПРОВАЛИЛАСЬ: " + e.getMessage());
+            log("   → Событие ОСТАЁТСЯ в outbox с published=false");
+        } finally {
+            KAFKA_FAILURE_MODE.set(false); // выключаем режим сбоя
+            log("🔧 [СБОЙ] KAFKA_FAILURE_MODE=false (сбой больше не воспроизводится)");
+        }
+
+        // ------------------------------------------------------------
+        // ШАГ 1.3: Проверяем состояние БД после сбоя
+        // ------------------------------------------------------------
+        log("");
+        log("🔍 [ПРОВЕРКА] Состояние после сбоя:");
+        try (Connection c = db()) {
+            try (PreparedStatement ps = c.prepareStatement(
+                    "select id, status, amount from orders where id = ?")) {
+                ps.setString(1, orderId);
+                ResultSet rs = ps.executeQuery();
+                if (rs.next()) {
+                    log("   orders:  id=%s status=%s amount=%d ✅ (заказ сохранён)"
+                        .formatted(rs.getString(1), rs.getString(2), rs.getInt(3)));
+                }
+            }
+            try (PreparedStatement ps = c.prepareStatement(
+                    "select id, event_type, published from outbox where aggregate_id = ?")) {
+                ps.setString(1, orderId);
+                ResultSet rs = ps.executeQuery();
+                if (rs.next()) {
+                    log("   outbox:  id=%s eventType=%s published=%s ⏳ (ждёт отправки)"
+                        .formatted(rs.getString(1), rs.getString(2), rs.getBoolean(3)));
+                }
+            }
+        }
+
+        // Проверяем, что Kafka не получила событие
+        log("");
+        log("🔍 [ПРОВЕРКА] Kafka: событие НЕ должно быть в orders.events");
+        consumeFixedExpectingNone("hw5-verify-failure", "orders.events", orderId);
+
+        log("");
+        log("═══════════════════════════════════════════════════════════════");
+        log("🎯 РЕЗУЛЬТАТ ШАГА 1: Заказ сохранён, событие НЕ потеряно, Kafka не в курсе.");
+        log("   → Запустите 'outbox-relay' для повторной отправки.");
+        log("═══════════════════════════════════════════════════════════════");
+    }
+    /**
+     * ============================================================
+     * 🎯 ДЗ №5, ЗАДАНИЯ 2 и 3: Повторная отправка из outbox
+     * ============================================================
+     *
+     * Что демонстрируем:
+     *
+     * 1. Publisher читает НЕОБРАБОТАННЫЕ записи из outbox
+     *    (WHERE published = false).
+     *
+     * 2. Отправляет их в Kafka, помечает published = true.
+     *
+     * 3. Это происходит ПОСЛЕ "восстановления" — то есть после того,
+     *    как мы отключили KAFKA_FAILURE_MODE.
+     *
+     * 4. Событие, "застрявшее" в outbox на шаге 1, наконец доходит до Kafka.
+     *
+     * Что мы получаем:
+     * ✅ Событие НЕ потеряно — Outbox гарантирует at-least-once доставку.
+     * ✅ Kafka получает событие с задержкой, но получает.
+     * ✅ Бизнес-данные и события в Kafka в конечном счёте консистентны.
+     * ============================================================
+     */
+    private static void runOutboxRelay() throws Exception {
+        banner("ДЗ №5 / ШАГ 2 - Повторная отправка из outbox (после 'восстановления')");
+
+        log("🔧 [СОСТОЯНИЕ] KAFKA_FAILURE_MODE=false → Kafka снова доступна");
+
+        // ------------------------------------------------------------
+        // ШАГ 2.1: Проверяем, что в outbox есть pending-событие
+        // ------------------------------------------------------------
+        log("");
+        log("🔍 [ПРОВЕРКА] pending-события в outbox:");
+        try (Connection c = db();
+            PreparedStatement ps = c.prepareStatement(
+                "select id, aggregate_id, event_type from outbox where published = false")) {
+            ResultSet rs = ps.executeQuery();
+            int pending = 0;
+            while (rs.next()) {
+                pending++;
+                log("   ⏳ id=%s aggregateId=%s eventType=%s"
+                    .formatted(rs.getString(1), rs.getString(2), rs.getString(3)));
+            }
+            if (pending == 0) {
+                log("   (нет pending-событий — сначала запустите 'outbox-fail')");
+                return;
+            }
+            log("   Всего pending: " + pending);
+        }
+
+        // ------------------------------------------------------------
+        // ШАГ 2.2: Отправляем pending-события в Kafka
+        // ------------------------------------------------------------
+        log("");
+        log("🚀 [RELAY] Отправляем pending-события в Kafka...");
+        relayOutboxOnce(); // ← ваш существующий метод, он работает без сбоя
+
+        // ------------------------------------------------------------
+        // ШАГ 2.3: Проверяем состояние после успешной отправки
+        // ------------------------------------------------------------
+        log("");
+        log("🔍 [ПРОВЕРКА] Состояние после успешной отправки:");
+        try (Connection c = db();
+            PreparedStatement ps = c.prepareStatement(
+                "select id, aggregate_id, event_type, published from outbox where published = false")) {
+            ResultSet rs = ps.executeQuery();
+            int stillPending = 0;
+            while (rs.next()) {
+                stillPending++;
+                log("   ❌ id=%s published=%s (не должно быть!)"
+                    .formatted(rs.getString(1), rs.getBoolean(4)));
+            }
+            if (stillPending == 0) {
+                log("   ✅ Все события отправлены (published=true)");
+            }
+        }
+
+        // ------------------------------------------------------------
+        // ШАГ 2.4: Проверяем, что Kafka получила событие
+        // ------------------------------------------------------------
+        log("");
+        log("🔍 [ПРОВЕРКА] Kafka: событие ДОЛЖНО быть в orders.events");
+        consumeFixed("hw5-verify-relay", "orders.events", 1, Duration.ofSeconds(8));
+
+        log("");
+        log("═══════════════════════════════════════════════════════════════");
+        log("🎯 РЕЗУЛЬТАТ ШАГА 2: Событие доставлено в Kafka через outbox.");
+        log("   → Система восстановилась без потери данных.");
+        log("═══════════════════════════════════════════════════════════════");
     }
 
     private static void inbox() throws Exception {
@@ -1031,6 +1256,64 @@ public class TrainingApp {
                 }
             }
             c.commit(); // < Фиксируем все изменения
+        }
+    }
+
+    /**
+     * ============================================================
+     * 🎯 ДЗ №5: relay с имитацией сбоя Kafka
+     * ============================================================
+     *
+     * Отличается от relayOutboxOnce() тем, что при KAFKA_FAILURE_MODE=true
+     * "падает" перед отправкой, эмулируя недоступность брокера.
+     *
+     * ВАЖНО: мы падаем ДО публикации события, поэтому в outbox
+     * ничего не меняется — событие остаётся с published=false.
+     * ============================================================
+     */
+    private static void relayOutboxOnceWithFailure() throws Exception {
+        if (KAFKA_FAILURE_MODE.get()) {
+            // Эмулируем сбой: producer не может подключиться к брокеру
+            throw new RuntimeException(
+                "Искусственный сбой: Kafka broker недоступен (KAFKA_FAILURE_MODE=true)");
+        }
+        // Если сбоя нет — работаем как обычно
+        relayOutboxOnce();
+    }
+
+    /**
+     * ============================================================
+     * 🎯 ДЗ №5: проверка, что событие НЕ появилось в Kafka
+     * ============================================================
+     *
+     * Читает топик с новой группой в течение wait-периода.
+     * Если найден eventType=OrderCreated с нужным aggregateId — сообщает об ошибке.
+     * Если ничего не найдено — это ОЖИДАЕМЫЙ результат (сбой сработал).
+     * ============================================================
+     */
+    private static void consumeFixedExpectingNone(String group, String topic, String expectedAggregateId) throws Exception {
+        try (KafkaConsumer<String, String> c = consumer(group)) {
+            c.subscribe(List.of(topic));
+            long until = System.currentTimeMillis() + 3000; // ждём 3 секунды
+            int found = 0;
+            while (System.currentTimeMillis() < until) {
+                ConsumerRecords<String, String> records = c.poll(Duration.ofMillis(500));
+                for (ConsumerRecord<String, String> r : records) {
+                    JsonNode n = JSON.readTree(r.value());
+                    if (n.path("aggregateId").asText().equals(expectedAggregateId)) {
+                        found++;
+                        log("   ❌ НАЙДЕНО в Kafka (не должно быть!): aggregateId=%s eventType=%s"
+                            .formatted(expectedAggregateId, n.path("eventType").asText()));
+                    }
+                }
+                c.commitSync();
+            }
+            if (found == 0) {
+                log("   ✅ Kafka НЕ получила событие для aggregateId=%s (сбой сработал корректно)"
+                    .formatted(expectedAggregateId));
+            } else {
+                log("   ❌ ОШИБКА: событие всё-таки попало в Kafka, хотя не должно было!");
+            }
         }
     }
 
