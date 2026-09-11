@@ -12,7 +12,7 @@
 | 2 | Reliable Delivery | [feature/homework-2](https://github.com/mowertii/kafka-training/tree/feature/homework-2) | ✅ Готово |
 | 3 | Error Handling: Retry, DLT, Backoff | [feature/homework-3](https://github.com/mowertii/kafka-training/tree/feature/homework-3) | ✅ Готово |
 | 4 | Idempotent consumer and inbox; replay and deduplication | [feature/homework-4](https://github.com/mowertii/kafka-training/tree/feature/homework-4) | ✅ Готово |
-
+| 5 | Transactional Outbox + Failure Testing | [feature/homework-5](https://github.com/mowertii/kafka-training/tree/feature/homework-5) | ✅ Готово |
 ---
 
 ## Как работать
