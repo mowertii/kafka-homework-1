@@ -30,7 +30,7 @@ if [ $? -ne 0 ]; then exit 1; fi
 
 echo
 echo "[4/4] VERIFY DB state:"
-docker exec -it kafka-training-postgres psql -U demo -d kafkademo -c "select id, aggregate_id, event_type, published from outbox order by created_at;"
+docker exec -it kafka-training-postgres psql -U demo -d kafkademo -c "select id, aggregate_id, event_type, status, published from outbox order by created_at;"
 if [ $? -ne 0 ]; then exit 1; fi
 
 echo

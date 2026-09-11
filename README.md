@@ -1,15 +1,12 @@
-# 📝 ДЗ №4 — Идемпотентный Consumer и Inbox Pattern
+# 📝 ДЗ №5 — Transactional Outbox + тестирование сбоев
 
 ## 📌 Описание
 
-Домашнее задание посвящено **идемпотентной обработке** сообщений в Kafka с использованием паттерна **Inbox**.
+Домашнее задание посвящено паттерну **Transactional Outbox** — надёжной передаче событий из БД в Kafka без потери данных при сбоях.
 
-- **Идемпотентность** — повторная обработка одного и того же события не изменяет результат
-- **Inbox Pattern** — таблица для хранения `eventId` уже обработанных событий
-- **Транзакционность** — проверка дубля и бизнес-операция выполняются в одной транзакции БД
-
-**Цель работы:**  
-Научиться строить Kafka-consumer, который корректно переживает повторную доставку сообщений, не нарушая согласованность бизнес-данных.
+- **Проблема:** последовательный вызов `save()` + `producer.send()` может потерять событие при падении между ними
+- **Решение:** сохранять событие в таблицу `outbox` **в одной транзакции** с бизнес-данными, а отправлять его отдельным publisher'ом
+- **Гарантия:** событие **не потеряется** даже при недоступности Kafka — оно останется в `outbox` до успешной отправки
 
 ---
 
@@ -19,7 +16,7 @@
 |-----------|--------|
 | **Docker** | 20.10+ |
 | **Docker Compose** | 2.0+ |
-| **Java** | 21 (в контейнере) |
+| **Java** | 21 |
 | **Kafka** | 4.3.1 (KRaft) |
 | **PostgreSQL** | 16 |
 
@@ -27,141 +24,261 @@
 
 ## 🚀 Запуск
 
-### 1. Клонирование
 ```bash
 git clone git@github.com:mowertii/kafka-training.git
 cd kafka-training
+git checkout feature/homework-5
 ```
 
-## Запуск ДЗ №4
-Windows (CMD/PowerShell):
-
+**Windows:**
 ```cmd
-hw4.cmd
+hw5.cmd
 ```
-Linux / macOS / Git Bash:
+
+**Linux / macOS / Git Bash:**
 ```bash
-./hw4.sh
+./hw5.sh
 ```
-## Что произойдёт автоматически
-Шаг	Команда	Действие	Результат
-1	init	Создание топиков и таблиц	11 топиков + 6 таблиц
-2	producer-dup	Отправка 5 уникальных + 1 дублированного ×3	8 сообщений в orders.events
-3	consumer-idempotent	Обработка с Inbox Pattern	6 новых + 2 пропущенных дубля
 
-## 📊 Таблицы БД
-Таблица |	Назначение
-orders |	Основная таблица заказов
-outbox |	Transactional Outbox
-inbox |	Обработанные eventId (ключевое для HW4)
-billing_payments |	Платежи
-order_projection |	CQRS read-model
-hw4_processed_orders |	Результаты обработки событий HW4
+### Что произойдёт автоматически
 
-## 📈 Реальные логи выполнения
-# Producer DUP
-```text
-========== PRODUCER DUP — уникальные события + намеренный дубль по eventId ==========
-[demo] send topic=orders.events partition=0 offset=0 key=hw4-order-1 eventType=OrderCreated
-[demo] send topic=orders.events partition=0 offset=1 key=hw4-order-2 eventType=OrderCreated
-[demo] send topic=orders.events partition=0 offset=2 key=hw4-order-3 eventType=OrderCreated
-[demo] send topic=orders.events partition=0 offset=3 key=hw4-order-4 eventType=OrderCreated
-[demo] send topic=orders.events partition=0 offset=4 key=hw4-order-5 eventType=OrderCreated
-[demo] Отправляем eventId=1cd7db62-0305-46bd-83b2-43be0879ba61 ТРИ раза подряд
-[demo] dup-send attempt=1 partition=2 offset=0 eventId=1cd7db62-0305-46bd-83b2-43be0879ba61
-[demo] dup-send attempt=2 partition=2 offset=1 eventId=1cd7db62-0305-46bd-83b2-43be0879ba61
-[demo] dup-send attempt=3 partition=2 offset=2 eventId=1cd7db62-0305-46bd-83b2-43be0879ba61
-[demo] Готово: 5 уникальных событий + 1 событие продублировано 3 раза.
+| Шаг | Команда | Действие | Результат |
+|-----|---------|----------|-----------|
+| 1 | `init` | Создание топиков и таблиц | 11 топиков + 6 таблиц |
+| 2 | `outbox-fail` | Заказ + outbox в одной транзакции → **СБОЙ** | Заказ в `orders`, событие в `outbox` (`status=pending`) |
+| 3 | `outbox-relay` | Повторная отправка | Событие в Kafka, `status=published` |
+| 4 | `psql` | Проверка состояния БД | `status=published`, `published=true` |
+
+---
+
+## 🔄 Схема работы
+
 ```
-# Consumer IDEMPOTENT
-```text
-========== CONSUMER IDEMPOTENT — name=consumer-idempotent-1, group=consumer-idempotent-group ==========
-[demo] Подписались на топик: orders.events
-[demo] Нет сообщений, продолжаем ждать...
-[demo] [consumer-idempotent-1] ✅ PROCESSED: eventId=0667c8ba-... orderId=hw4-order-1 amount=100 — записано в hw4_processed_orders и inbox
-[demo] [consumer-idempotent-1] ✅ PROCESSED: eventId=32891d3d-... orderId=hw4-order-2 amount=200 — записано в hw4_processed_orders и inbox
-[demo] [consumer-idempotent-1] ✅ PROCESSED: eventId=45507fb6-... orderId=hw4-order-3 amount=300 — записано в hw4_processed_orders и inbox
-[demo] [consumer-idempotent-1] ✅ PROCESSED: eventId=8c05b8a3-... orderId=hw4-order-4 amount=400 — записано в hw4_processed_orders и inbox
-[demo] [consumer-idempotent-1] ✅ PROCESSED: eventId=bd2dbfc7-... orderId=hw4-order-5 amount=500 — записано в hw4_processed_orders и inbox
-[demo] [consumer-idempotent-1] ✅ PROCESSED: eventId=1cd7db62-... orderId=hw4-order-DUP amount=777 — записано в hw4_processed_orders и inbox
-[demo] [consumer-idempotent-1] ⚠️ DUPLICATE SKIPPED: eventId=1cd7db62-... orderId=hw4-order-DUP — уже обработано, пропускаем
-[demo] [consumer-idempotent-1] ⚠️ DUPLICATE SKIPPED: eventId=1cd7db62-... orderId=hw4-order-DUP — уже обработано, пропускаем
-[demo] Consumer 'consumer-idempotent-1' завершил работу. Обработано новых: 6, пропущено дублей: 2
+┌─────────────────────────────────────────────────────────────────────┐
+│ ШАГ 1. Бизнес-транзакция (атомарная)                                │
+│                                                                     │
+│   ┌─────────────────┐         ┌─────────────────────────┐           │
+│   │  INSERT orders  │         │  INSERT outbox          │           │
+│   │                 │         │  (status='pending')     │           │
+│   └────────┬────────┘         └───────────┬─────────────┘           │
+│            └──────────────┬───────────────┘                         │
+│                           ▼                                         │
+│                    COMMIT TRANSACTION                               │
+└─────────────────────────────────────────────────────────────────────┘
+                            │
+                            ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│ ШАГ 2. Publisher (батчами, короткими транзакциями)                  │
+│                                                                     │
+│   T1: SELECT ... WHERE status='pending' LIMIT 100 FOR UPDATE SKIP   │
+│       UPDATE status='processing'                                    │
+│       COMMIT                                                        │
+│                                                                     │
+│   Send to Kafka (ВНЕ транзакции)                                    │
+│                                                                     │
+│   T2: UPDATE status='published' WHERE id IN (sent)                  │
+│       UPDATE status='pending'   WHERE id IN (failed)                │
+│       COMMIT                                                        │
+└─────────────────────────────────────────────────────────────────────┘
 ```
-# Ключевые строки:
-✅ PROCESSED — 6 раз (5 уникальных + 1 первое из дублей)
-⚠️ DUPLICATE SKIPPED — 2 раза (повторные доставки)
-📊 Итог: Обработано новых: 6, пропущено дублей: 2
 
-## ❓ Вопросы и ответы (из ТЗ)
+---
+
+## 📊 Статусы `outbox`
+
+| Статус | Значение |
+|--------|----------|
+| `pending` | Ждёт отправки (default) |
+| `processing` | Взято relay'ем в работу — защита от гонки между инстансами |
+| `published` | Успешно отправлено в Kafka |
+| `failed` | Постоянная ошибка, требует ручного разбора |
+
+---
+
+## 📈 Ожидаемые логи
+
+### Шаг 2 — `outbox-fail`
+
+```
+📝 [БД] orders: id=hw5-order-fail-1 status=CREATED amount=1500
+📝 [БД] outbox: id=<uuid> eventType=OrderCreated published=false
+✅ [БД] Транзакция закоммичена: order + outbox записаны АТОМАРНО. Kafka ещё не знает.
+
+🔥 [СБОЙ] KAFKA_FAILURE_MODE=true
+❌ [KAFKA] Отправка ПРОВАЛИЛАСЬ: Искусственный сбой
+🔧 [СБОЙ] KAFKA_FAILURE_MODE=false
+
+🔍 [ПРОВЕРКА] Состояние после сбоя:
+   orders:  id=hw5-order-fail-1 status=CREATED amount=1500 ✅
+   outbox:  id=<uuid> eventType=OrderCreated published=false status=pending ⏳
+
+🔍 [ПРОВЕРКА] Kafka: событие НЕ должно быть в orders.events
+   ✅ Kafka НЕ получила событие для aggregateId=hw5-order-fail-1
+```
+
+### Шаг 3 — `outbox-relay`
+
+```
+🔍 [ПРОВЕРКА] pending-события в outbox:
+   ⏳ id=<uuid> aggregateId=hw5-order-fail-1 eventType=OrderCreated status=pending
+
+🚀 [RELAY] Запуск relay с батчингом (BATCH_SIZE=100)
+📥 [RELAY] Взят батч: 1 событий (status='processing')
+send topic=orders.events partition=0 offset=0 key=hw5-order-fail-1 eventType=OrderCreated
+📤 [RELAY] Батч завершён: отправлено=1, ошибок=0
+
+🔍 [ПРОВЕРКА] Состояние после успешной отправки:
+   ✅ Все события отправлены (status='published', published=true)
+
+🔍 [ПРОВЕРКА] Kafka: событие ДОЛЖНО быть в orders.events
+CONSUME topic=orders.events partition=0 offset=0 key=hw5-order-fail-1 eventType=OrderCreated
+```
+
+### Финальная проверка БД
+
+```
+                  id                  |   aggregate_id   |  event_type  |  status   | published
+--------------------------------------+------------------+--------------+-----------+-----------
+ 5593d63e-bd9c-437c-a7f7-dd96aa5e38bd | hw5-order-fail-1 | OrderCreated | published | t
+```
+
+---
+
+## ❓ Ответы на вопросы ТЗ
+
 ### Какую проблему решает Transactional Outbox?
-* Проблема dual-write. Когда приложение должно одновременно:
-Сохранить данные в свою БД (например, создать заказ)
-Отправить событие в Kafka (например, OrderCreated)
-— оно пишет в две разные системы, и между этими записями нет атомарности. Это классическая проблема distributed systems, известная как dual-write problem.
 
-**Что может пойти не так:**
+**Проблему dual-write.** Приложение пишет в **две системы** — БД и Kafka — и между этими записями **нет атомарности**.
 
-| Сценарий | Что произошло | Последствие |
-|----------|---------------|-------------|
-| 1 | `save()` OK, `send()` FAIL | Заказ в БД есть, Kafka не знает → downstream рассинхронизирован |
-| 2 | `save()` OK, приложение упало перед `send()` | То же самое |
-| 3 | `save()` FAIL, `send()` OK | Событие об уже не существующем заказе → ещё хуже |
-| 4 | `save()` OK, `send()` OK, но ack потерялся | Дубль события в Kafka |
+Возможные сбои:
 
-# Transactional Outbox решает эту проблему так:
-Бизнес-данные и событие пишутся в одну БД — в одной транзакции. Либо оба INSERT'а проходят, либо ни один.
-Событие пока не уходит в Kafka — оно просто лежит в таблице outbox со статусом published=false.
-Отдельный publisher (relay) читает outbox и отправляет события в Kafka после успешного коммита бизнес-транзакции.
-Если Kafka недоступна — publisher ретраит, а событие остаётся в outbox до успеха.
+| Сценарий | Последствие |
+|----------|-------------|
+| `save()` OK, `send()` FAIL | Заказ в БД есть, Kafka не знает |
+| `save()` OK, приложение упало перед `send()` | То же самое |
+| `save()` FAIL, `send()` OK | Событие о несуществующем заказе |
+| `save()` OK, `send()` OK, ack потерялся | Дубль в Kafka |
 
-Итог: приложение больше не зависит от доступности Kafka в момент бизнес-операции. Событие гарантированно попадёт в Kafka (at-least-once), даже если брокер временно лежит.
+**Transactional Outbox решает так:**
+1. Бизнес-данные и событие пишутся в **одну БД** — в одной транзакции.
+2. Событие лежит в `outbox` со статусом `pending` и **пока не уходит в Kafka**.
+3. Отдельный publisher отправляет события в Kafka **после** коммита бизнес-транзакции.
+4. Если Kafka недоступна — событие остаётся в `outbox` до успеха.
 
-# Почему недостаточно последовательно выполнить save() и producer.send()?
+**Итог:** приложение не зависит от доступности Kafka в момент бизнес-операции. Событие **гарантированно** попадёт в Kafka (at-least-once).
+
+---
+
 ### Почему недостаточно последовательно выполнить `save()` и `producer.send()`?
 
-Потому что **между этими двумя вызовами нет транзакции**. Это две независимые операции над двумя разными системами (БД и Kafka), и между ними может произойти что угодно.
+Потому что **между этими двумя вызовами нет транзакции**. Это две независимые операции над двумя разными системами.
 
-**Некорректный код:**
-
+**Наивный код:**
 ```java
-// ❌ ПЛОХО
 orderRepository.save(order);       // ← строка 1
 kafkaProducer.send(event);         // ← строка 2
 ```
 
 **Проблемы:**
+1. **Разрыв между строками 1 и 2.** Приложение упало/сеть отвалилась **после** `save()`, но **до** `send()` — событие никогда не уйдёт в Kafka.
+2. **Обратный порядок — тоже плохо.** `send()` OK, `save()` упал — событие о несуществующем заказе.
+3. **Нет ретраев.** Даже с `try/catch` нет гарантии, что повторная отправка не создаст дубль.
+4. **Нет «точки истины».** Непонятно, что уже отправлено, а что нет — нечем восстановиться после сбоя.
 
-1. **Разрыв между строками 1 и 2.**  
-   Если приложение упадёт (crash, OOM, kill -9), сеть отвалится, или БД/Kafka временно недоступны **после** `save()`, но **до** `send()` — событие никогда не уйдёт в Kafka. Заказ в БД есть, downstream ничего не знает.
+**С Outbox:** заказ + событие в одной транзакции → атомарность, восстановление, развязка с Kafka.
 
-2. **Обратный порядок — тоже плохо.**  
-   Если сначала `send()`, потом `save()`, и `save()` упадёт — событие в Kafka уже улетело, но заказа нет. Consumers начнут обрабатывать событие о несуществующем заказе.
+**Ключевая мысль:** `save()` + `producer.send()` — это **распределённая транзакция без координатора**. Outbox — самый простой способ решить эту проблему.
 
-3. **Нет ретраев и идемпотентности.**  
-   Даже если обернуть `send()` в `try/catch` и повторять при ошибке — нет гарантии, что повторная отправка не создаст дубль (Kafka по умолчанию at-least-once). А если приложение упадёт в момент ретрая — событие потеряется.
+---
 
-4. **Нет «точки истины».**  
-   Приложение не знает, что именно уже отправлено, а что — нет. Нет таблицы, по которой можно восстановиться после сбоя.
+## 🛠️ Устранение долгих блокировок (замечание ревью)
 
-**С Transactional Outbox:**
+### Проблема в первой (базовой) версии
+
+Одна длинная транзакция держала блокировки `FOR UPDATE` на всё время синхронной отправки в Kafka:
 
 ```java
-// ✅ ХОРОШО
-@Transactional
-void createOrder(Order order) {
-    orderRepository.save(order);
-    outboxRepository.save(new OutboxEvent(order)); // ← в одной транзакции!
+c.setAutoCommit(false);
+SELECT ... FOR UPDATE SKIP LOCKED    ← открываем транзакцию
+for (each row) {
+    producer.send(...).get();        ← синхронный I/O
+    UPDATE published=true;
 }
-// Отдельный publisher читает outbox и шлёт в Kafka
+c.commit();                          ← закрываем транзакцию
 ```
 
-- **Атомарность:** либо и заказ, и событие записаны, либо ничего.
-- **Восстановление:** после сбоя publisher видит все `published=false` записи и отправляет их.
-- **Идемпотентность:** publisher может ретраить сколько угодно — он просто помечает запись `published=true` после успеха.
-- **Развязка:** бизнес-транзакция не зависит от доступности Kafka.
+**Последствия:**
+- Медленный брокер (100 ms × 1000 событий = 100 секунд) → долгие блокировки в PostgreSQL
+- Bloat, рост WAL, параллельные relay'и ждут
+- Откат всей транзакции при ошибке в середине
 
-**Ключевая мысль:** `save()` + `producer.send()` — это **распределённая транзакция без координатора**. Такие транзакции **не работают** без дополнительных паттернов (Outbox, Saga, 2PC). Outbox — самый простой и надёжный способ решить эту проблему без распределённых транзакций.
+### Что стало — батчинг + две короткие транзакции
+
+1. **Транзакция №1:** `SELECT ... LIMIT 100 FOR UPDATE SKIP LOCKED` → `UPDATE status='processing'` → **COMMIT** (блокировки сняты).
+2. **Отправка в Kafka** — **вне** транзакции БД.
+3. **Транзакция №2:** `UPDATE status='published'` для успешных, `UPDATE status='pending'` для ошибочных → **COMMIT**.
+
+**Результат:**
+
+| Было | Стало |
+|------|-------|
+| ❌ Транзакция открыта всё время отправки | ✅ Транзакция — только на чтение и обновление |
+| ❌ `FOR UPDATE` держит блокировки долго | ✅ Блокировки сняты после COMMIT №1 |
+| ❌ Параллельные relay'и ждут | ✅ `SKIP LOCKED` + `status='processing'` |
+| ❌ Ошибка в середине → откат всего | ✅ Ошибочные → `pending`, успешные зафиксированы |
+| ❌ Медленный брокер = долгие блокировки | ✅ БД не страдает |
+
+### Известное ограничение
+
+Между **Транзакцией №1** и **Транзакцией №2** блокировка **снята**. Если relay упадёт **после** `send()` в Kafka, но **до** `UPDATE status='published'`:
+
+- Событие **уже в Kafka**.
+- Статус в БД остался `processing`.
+- При следующем запуске relay увидит `processing`-строки, только если добавить их обработку.
+
+**Решения для production:**
+1. **Периодический retry `processing`:** `WHERE status='processing' AND updated_at < NOW() - INTERVAL '5 minutes'` → вернуть в `pending`.
+2. **Exactly-once producer (транзакции Kafka)** — сложнее, но убирает дубли.
+3. **Debezium CDC** — читать WAL PostgreSQL вместо polling, гонок нет.
+
+**Для учебного ДЗ:** семантика **at-least-once** — событие гарантированно уйдёт, но при сбое между `send` и `UPDATE` возможен **дубль**. Защита от дублей — задача потребителя (см. ДЗ №4, Inbox Pattern).
+
+---
+
+## 🧹 Остановка
+
+```bash
+stop.cmd   # или ./stop.sh (Linux)
+docker compose -p kafka-training down -v   # полная очистка
+```
+
+---
+
+## 🛠️ Технологии
+
+| Компонент | Версия |
+|-----------|--------|
+| **Java** | 21 |
+| **Apache Kafka** | 4.3.1 (KRaft) |
+| **PostgreSQL** | 16 |
+| **Docker Compose** | latest |
+| **Maven** | 3.9.9 |
+| **Jackson** | 2.17.2 |
+
+---
+
+## 🏆 Чек-лист требований ТЗ
+
+| Требование | Статус |
+|------------|--------|
+| Java-сервис с БД, Kafka, Outbox | ✅ |
+| Заказ + `OrderCreated` в одной транзакции | ✅ |
+| Publisher читает необработанные записи | ✅ |
+| Воспроизведение сбоя отправки | ✅ |
+| Повторная отправка после восстановления | ✅ |
+| Логи: сохранение → неуспех → повтор → успех | ✅ |
+| Docker Compose | ✅ |
+| README с ответами на вопросы | ✅ |
 
 ---
 
@@ -169,4 +286,4 @@ void createOrder(Order order) {
 
 **Имя:** [Ilyas]  
 **Курс:** Otus "Администрирование платформы Apache Kafka"  
-**Дата:** 2026-09-11  
+**Дата:** 2026-09-11

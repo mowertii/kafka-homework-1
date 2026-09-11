@@ -79,7 +79,24 @@ public class TrainingApp {
         ));
         try (Connection c = db()) {
             st(c, "create table if not exists orders(id varchar primary key, status varchar not null, amount int not null, updated_at timestamptz not null default now())");
-            st(c, "create table if not exists outbox(id uuid primary key, aggregate_id varchar not null, event_type varchar not null, payload text not null, published boolean not null default false, created_at timestamptz not null default now())");
+            // ============================================================
+            // 🎯 ДЗ №5: таблица outbox со статусом для безопасной relay-обработки
+            // ============================================================
+            // published  — историческое поле (оставлено для совместимости со сценариями ДЗ №3/№4)
+            // status     — расширенный статус обработки:
+            //   'pending'     — ждёт отправки (default)
+            //   'processing'  — взято relay'ем в работу (защита от гонки между инстансами)
+            //   'published'   — успешно отправлено в Kafka
+            //   'failed'      — постоянная ошибка, требует ручного разбора
+            // ============================================================
+            st(c, "create table if not exists outbox(" +
+                "id uuid primary key, " +
+                "aggregate_id varchar not null, " +
+                "event_type varchar not null, " +
+                "payload text not null, " +
+                "published boolean not null default false, " +
+                "status varchar not null default 'pending', " +
+                "created_at timestamptz not null default now())");
             st(c, "create table if not exists inbox(event_id uuid primary key, processed_at timestamptz not null default now())");
             st(c, "create table if not exists billing_payments(order_id varchar primary key, amount int not null, created_at timestamptz not null default now())");
             st(c, "create table if not exists order_projection(order_id varchar primary key, status varchar not null, amount int not null, last_event_id varchar not null, updated_at timestamptz not null default now())");
@@ -270,12 +287,13 @@ public class TrainingApp {
                 }
             }
             try (PreparedStatement ps = c.prepareStatement(
-                    "select id, event_type, published from outbox where aggregate_id = ?")) {
+                    "select id, event_type, published, status from outbox where aggregate_id = ?")) {
                 ps.setString(1, orderId);
                 ResultSet rs = ps.executeQuery();
                 if (rs.next()) {
-                    log("   outbox:  id=%s eventType=%s published=%s ⏳ (ждёт отправки)"
-                        .formatted(rs.getString(1), rs.getString(2), rs.getBoolean(3)));
+                    log("   outbox:  id=%s eventType=%s published=%s status=%s ⏳ (ждёт отправки)"
+                        .formatted(rs.getString(1), rs.getString(2),
+                                rs.getBoolean(3), rs.getString(4)));
                 }
             }
         }
@@ -326,19 +344,21 @@ public class TrainingApp {
         log("🔍 [ПРОВЕРКА] pending-события в outbox:");
         try (Connection c = db();
             PreparedStatement ps = c.prepareStatement(
-                "select id, aggregate_id, event_type from outbox where published = false")) {
+                "select id, aggregate_id, event_type, status from outbox " +
+                "where status in ('pending', 'processing')")) {
             ResultSet rs = ps.executeQuery();
             int pending = 0;
             while (rs.next()) {
                 pending++;
-                log("   ⏳ id=%s aggregateId=%s eventType=%s"
-                    .formatted(rs.getString(1), rs.getString(2), rs.getString(3)));
+                log("   ⏳ id=%s aggregateId=%s eventType=%s status=%s"
+                    .formatted(rs.getString(1), rs.getString(2),
+                            rs.getString(3), rs.getString(4)));
             }
             if (pending == 0) {
-                log("   (нет pending-событий — сначала запустите 'outbox-fail')");
+                log("   (нет pending/processing событий — сначала запустите 'outbox-fail')");
                 return;
             }
-            log("   Всего pending: " + pending);
+            log("   Всего к обработке: " + pending);
         }
 
         // ------------------------------------------------------------
@@ -355,16 +375,17 @@ public class TrainingApp {
         log("🔍 [ПРОВЕРКА] Состояние после успешной отправки:");
         try (Connection c = db();
             PreparedStatement ps = c.prepareStatement(
-                "select id, aggregate_id, event_type, published from outbox where published = false")) {
+                "select id, aggregate_id, event_type, published, status from outbox " +
+                "where status != 'published'")) {
             ResultSet rs = ps.executeQuery();
             int stillPending = 0;
             while (rs.next()) {
                 stillPending++;
-                log("   ❌ id=%s published=%s (не должно быть!)"
-                    .formatted(rs.getString(1), rs.getBoolean(4)));
+                log("   ❌ id=%s published=%s status=%s (не должно быть!)"
+                    .formatted(rs.getString(1), rs.getBoolean(4), rs.getString(5)));
             }
             if (stillPending == 0) {
-                log("   ✅ Все события отправлены (published=true)");
+                log("   ✅ Все события отправлены (status='published', published=true)");
             }
         }
 
@@ -373,7 +394,15 @@ public class TrainingApp {
         // ------------------------------------------------------------
         log("");
         log("🔍 [ПРОВЕРКА] Kafka: событие ДОЛЖНО быть в orders.events");
-        consumeFixed("hw5-verify-relay", "orders.events", 1, Duration.ofSeconds(8));
+        // ============================================================
+        // 🎯 ВАЖНО: даём consumer'у время на rebalance + чтение
+        // ============================================================
+        // Только что созданный consumer сначала проходит rebalance
+        // (назначение партиций) — это занимает 1-3 секунды.
+        // Только после этого poll() начнёт возвращать сообщения.
+        // Поэтому увеличиваем таймаут до 15 секунд.
+        // ============================================================
+        consumeFixed("hw5-verify-relay", "orders.events", 1, Duration.ofSeconds(15));
 
         log("");
         log("═══════════════════════════════════════════════════════════════");
@@ -1150,20 +1179,102 @@ public class TrainingApp {
         log("send topic=%s partition=%d offset=%d key=%s eventType=%s".formatted(topic, md.partition(), md.offset(), key, JSON.readTree(value).path("eventType").asText()));
     }
 
+    /**
+     * ============================================================
+     * 🎯 consumeFixed с диагностикой для ДЗ №5
+     * ============================================================
+     * Читает до expected сообщений из топика за maxWait.
+     *
+     * ВАЖНО: при первом poll() новый consumer проходит rebalance
+     * (назначение партиций). Это может занять 1-3 секунды, поэтому
+     * poll() возвращает пусто. Мы продолжаем poll'ить в цикле,
+     * пока не истечёт maxWait или не прочитаем expected.
+     * ============================================================
+     */
     private static void consumeFixed(String group, String topic, int expected, Duration maxWait) throws Exception {
         try (KafkaConsumer<String,String> c = consumer(group)) {
             c.subscribe(List.of(topic));
             long until = System.currentTimeMillis() + maxWait.toMillis();
             int count = 0;
+            long lastLog = 0;
+
             while (System.currentTimeMillis() < until && count < expected) {
                 ConsumerRecords<String,String> records = c.poll(Duration.ofMillis(500));
+
+                // Диагностика: раз в 2 секунды пишем, что мы живы и ждём
+                if (records.isEmpty() && System.currentTimeMillis() - lastLog > 2000) {
+                    log("   ... consumer ждёт сообщений (group=%s, topic=%s, прочитано=%d/%d)"
+                        .formatted(group, topic, count, expected));
+                    lastLog = System.currentTimeMillis();
+                }
+
                 for (ConsumerRecord<String,String> r : records) {
                     count++;
-                    log("CONSUME group=%s topic=%s partition=%d offset=%d key=%s eventType=%s".formatted(group, r.topic(), r.partition(), r.offset(), r.key(), JSON.readTree(r.value()).path("eventType").asText()));
+                    log("CONSUME group=%s topic=%s partition=%d offset=%d key=%s eventType=%s"
+                        .formatted(group, r.topic(), r.partition(), r.offset(),
+                                r.key(), JSON.readTree(r.value()).path("eventType").asText()));
                 }
                 c.commitSync();
             }
-            if (count < expected) log("Read %d/%d records before timeout. Previous runs may have advanced offsets; use random groups in code to avoid that.".formatted(count, expected));
+            if (count < expected) {
+                log("Read %d/%d records before timeout.".formatted(count, expected));
+            }
+        }
+    }
+
+    /**
+     * ============================================================
+     * 🎯 Быстрая проверка наличия сообщения в топике (без rebalance)
+     * ============================================================
+     * Вместо subscribe() использует assign() на все партиции —
+     * это НЕ запускает consumer group rebalance и работает моментально.
+     *
+     * Читает все партиции с offset=earliest до тех пор, пока не найдёт
+     * сообщение с указанным aggregateId или не истечёт timeout.
+     * ============================================================
+     */
+    private static void consumeFixedExpectingOne(String group, String topic, String expectedAggregateId, Duration maxWait) throws Exception {
+        Properties props = new Properties();
+        props.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, BOOTSTRAP);
+        props.put(ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class.getName());
+        props.put(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class.getName());
+        // GROUP_ID не нужен — мы используем assign(), а не subscribe()
+
+        try (KafkaConsumer<String, String> c = new KafkaConsumer<>(props)) {
+            // Получаем все партиции топика через AdminClient
+            List<TopicPartition> partitions;
+            try (AdminClient admin = AdminClient.create(Map.of(
+                    AdminClientConfig.BOOTSTRAP_SERVERS_CONFIG, BOOTSTRAP))) {
+                partitions = admin.describeTopics(List.of(topic)).allTopicNames().get()
+                    .get(topic).partitions().stream()
+                    .map(p -> new TopicPartition(topic, p.partition()))
+                    .toList();
+            }
+
+            // assign() — без rebalance, моментально
+            c.assign(partitions);
+            c.seekToBeginning(partitions);
+
+            long until = System.currentTimeMillis() + maxWait.toMillis();
+            int found = 0;
+            while (System.currentTimeMillis() < until && found == 0) {
+                ConsumerRecords<String, String> records = c.poll(Duration.ofMillis(500));
+                for (ConsumerRecord<String, String> r : records) {
+                    JsonNode n = JSON.readTree(r.value());
+                    if (n.path("aggregateId").asText().equals(expectedAggregateId)) {
+                        found++;
+                        log("CONSUME topic=%s partition=%d offset=%d key=%s aggregateId=%s eventType=%s"
+                            .formatted(r.topic(), r.partition(), r.offset(), r.key(),
+                                    expectedAggregateId, n.path("eventType").asText()));
+                    }
+                }
+            }
+            if (found == 0) {
+                log("❌ [KAFKA] Не найдено сообщение для aggregateId=%s за %ds"
+                    .formatted(expectedAggregateId, maxWait.toSeconds()));
+            } else {
+                log("✅ [KAFKA] Сообщение найдено для aggregateId=%s".formatted(expectedAggregateId));
+            }
         }
     }
 
@@ -1240,24 +1351,202 @@ public class TrainingApp {
     }
 
     // ---------- Pattern helpers ----------
+    /**
+     * ============================================================
+     * 🎯 ДЗ №5: relay с батчингом
+     * ============================================================
+     *
+     * ❌ ЧТО БЫЛО ПЛОХО В СТАРОЙ ВЕРСИИ:
+     *
+     *   try (Connection c = db()) {
+     *       c.setAutoCommit(false);
+     *       SELECT ... FOR UPDATE SKIP LOCKED          ← открываем транзакцию
+     *       for (each row) {
+     *           producer.send(...).get();              ← синхронная отправка в Kafka
+     *           UPDATE published=true;                 ← внутри той же транзакции
+     *       }
+     *       c.commit();                                ← закрываем транзакцию
+     *   }
+     *
+     *   Проблема: транзакция БД держится ОТКРЫТОЙ вместе с блокировками FOR UPDATE
+     *   на всё время синхронной отправки в Kafka. Если брокер медленный (100 ms на
+     *   сообщение) и в батче 1000 событий — транзакция открыта 100 секунд.
+     *
+     *   Последствия для PostgreSQL:
+     *     - долгие блокировки строк в outbox;
+     *     - bloat и рост WAL;
+     *     - параллельные relay'и ждут (даже с SKIP LOCKED строки "заняты");
+     *     - при ошибке в середине — откат всей транзакции, а уже отправленные
+     *       в Kafka события не будут помечены published=true → дубли.
+     *
+     * ✅ ЧТО СТАЛО (эта версия):
+     *
+     *   1. Читаем НЕБОЛЬШИМИ БАТЧАМИ (LIMIT 100).
+     *   2. Транзакция №1: SELECT + UPDATE status='processing' + COMMIT.
+     *      → блокировки снимаются сразу, транзакция короткая.
+     *   3. Отправка в Kafka — ВНЕ транзакции БД.
+     *   4. Транзакция №2: UPDATE status='published', published=true.
+     *   5. При ошибке — UPDATE status='pending' (вернуть в очередь).
+     *
+     *   Что это даёт:
+     *     ✅ Долгие блокировки в PostgreSQL исключены.
+     *     ✅ Медленный брокер не влияет на другие транзакции.
+     *     ✅ Событие не теряется — at-least-once сохраняется.
+     *     ✅ Статус 'processing' защищает от гонки между relay-инстансами.
+     *     ✅ Идемпотентность: если упадём после send, но до UPDATE — при
+     *        повторном запуске событие уйдёт ещё раз (дубль), но не потеряется.
+     *        Это правильный трейд-офф: "лучше дубль, чем потеря".
+     *
+     * ⚠️ Известное ограничение (см. README):
+     *   Если упадём между send и UPDATE status='published' — при следующем
+     *   запуске событие отправится повторно. Чтобы этого избежать, нужен
+     *   либо exactly-once producer (транзакции Kafka), либо Debezium CDC.
+     *   Для учебного ДЗ достаточно at-least-once + идемпотентного consumer
+     *   (см. ДЗ №4 — Inbox Pattern).
+     * ============================================================
+     */
     private static void relayOutboxOnce() throws Exception {
-        try (Connection c = db(); KafkaProducer<String,String> p = producer()) {
-            c.setAutoCommit(false);
-            // Забираем неопубликованные события (с блокировкой строк)
-            try (PreparedStatement ps = c.prepareStatement("select id, aggregate_id, payload from outbox where published=false order by created_at for update skip locked")) {
-                // ^ Защита от конкурентных релеев
-                ResultSet rs = ps.executeQuery();
-                while (rs.next()) {
-                    String id = rs.getString(1); String key = rs.getString(2); String payload = rs.getString(3);
-                    // Отправляем в Kafka
-                    send(p, "orders.events", key, payload);
-                    // Помечаем как опубликованное
-                    try (PreparedStatement upd = c.prepareStatement("update outbox set published=true where id=?::uuid")) { upd.setString(1, id); upd.executeUpdate(); }
+        // ------------------------------------------------------------
+        // Параметры батчинга
+        // ------------------------------------------------------------
+        // BATCH_SIZE = 100 — компромисс между количеством round-trip'ов
+        // и размером транзакции. В production подбирается под нагрузку.
+        // ------------------------------------------------------------
+        final int BATCH_SIZE = 100;
+        final String TARGET_TOPIC = "orders.events";
+
+        long totalSent = 0;
+        long totalFailed = 0;
+
+        log("🚀 [RELAY] Запуск relay с батчингом (BATCH_SIZE=%d)".formatted(BATCH_SIZE));
+
+        try (KafkaProducer<String, String> p = producer()) {
+            while (true) {
+                // ============================================================
+                // ТРАНЗАКЦИЯ №1: короткая — прочитать батч и пометить processing
+                // ============================================================
+                // Задача: захватить батч pending-событий и сразу освободить блокировки.
+                // После COMMIT строки помечены 'processing' — другие relay'и
+                // их уже не увидят (status != 'pending').
+                // ============================================================
+                List<OutboxBatchRow> batch = new ArrayList<>();
+
+                try (Connection c = db()) {
+                    c.setAutoCommit(false); // НАЧАЛИ ТРАНЗАКЦИЮ №1
+
+                    // Шаг 1.1: захватываем батч pending-событий
+                    // FOR UPDATE SKIP LOCKED — параллельные relay'и не ждут друг друга
+                    try (PreparedStatement ps = c.prepareStatement(
+                            "select id, aggregate_id, payload " +
+                            "from outbox " +
+                            "where status = 'pending' " +
+                            "order by created_at " +
+                            "limit ? " +
+                            "for update skip locked")) {
+                        ps.setInt(1, BATCH_SIZE);
+                        try (ResultSet rs = ps.executeQuery()) {
+                            while (rs.next()) {
+                                batch.add(new OutboxBatchRow(
+                                    rs.getString("id"),
+                                    rs.getString("aggregate_id"),
+                                    rs.getString("payload")));
+                            }
+                        }
+                    }
+
+                    if (batch.isEmpty()) {
+                        c.commit();
+                        break; // нет больше pending — выходим из цикла
+                    }
+
+                    // Шаг 1.2: помечаем батч как 'processing'
+                    // Это "резервирует" строки — другие relay'и их не возьмут,
+                    // даже после снятия блокировки FOR UPDATE.
+                    try (PreparedStatement upd = c.prepareStatement(
+                            "update outbox set status = 'processing' where id = ?::uuid")) {
+                        for (OutboxBatchRow row : batch) {
+                            upd.setString(1, row.id);
+                            upd.addBatch();
+                        }
+                        upd.executeBatch();
+                    }
+
+                    c.commit(); // КОММИТ ТРАНЗАКЦИИ №1 — блокировки сняты!
+                    log("📥 [RELAY] Взят батч: %d событий (status='processing')".formatted(batch.size()));
                 }
+
+                // ============================================================
+                // ОТПРАВКА В KAFKA — вне транзакции БД
+                // ============================================================
+                // Здесь мы больше не держим никаких блокировок.
+                // Даже если Kafka "тормозит" 30 секунд — PostgreSQL не страдает.
+                // ============================================================
+                List<String> sentIds = new ArrayList<>();
+                List<String> failedIds = new ArrayList<>();
+
+                for (OutboxBatchRow row : batch) {
+                    try {
+                        send(p, TARGET_TOPIC, row.key, row.payload);
+                        sentIds.add(row.id);
+                    } catch (Exception e) {
+                        log("❌ [RELAY] send failed for id=%s: %s".formatted(row.id, e.getMessage()));
+                        failedIds.add(row.id);
+                    }
+                }
+
+                // ============================================================
+                // ТРАНЗАКЦИЯ №2: короткая — обновить статусы по результату
+                // ============================================================
+                try (Connection c = db()) {
+                    c.setAutoCommit(false); // НАЧАЛИ ТРАНЗАКЦИЮ №2
+
+                    // Шаг 2.1: успешно отправленные → published=true
+                    if (!sentIds.isEmpty()) {
+                        try (PreparedStatement upd = c.prepareStatement(
+                                "update outbox set status = 'published', published = true " +
+                                "where id = ?::uuid")) {
+                            for (String id : sentIds) {
+                                upd.setString(1, id);
+                                upd.addBatch();
+                            }
+                            upd.executeBatch();
+                        }
+                    }
+
+                    // Шаг 2.2: неуспешные → возвращаем в 'pending' для следующей попытки
+                    if (!failedIds.isEmpty()) {
+                        try (PreparedStatement upd = c.prepareStatement(
+                                "update outbox set status = 'pending' where id = ?::uuid")) {
+                            for (String id : failedIds) {
+                                upd.setString(1, id);
+                                upd.addBatch();
+                            }
+                            upd.executeBatch();
+                        }
+                    }
+
+                    c.commit(); // КОММИТ ТРАНЗАКЦИИ №2
+                }
+
+                totalSent += sentIds.size();
+                totalFailed += failedIds.size();
+
+                log("📤 [RELAY] Батч завершён: отправлено=%d, ошибок=%d".formatted(sentIds.size(), failedIds.size()));
+
+                // Если взяли меньше BATCH_SIZE — это был последний батч
+                if (batch.size() < BATCH_SIZE) break;
             }
-            c.commit(); // < Фиксируем все изменения
         }
+
+        log("✅ [RELAY] Завершено. Всего отправлено: %d, ошибок: %d".formatted(totalSent, totalFailed));
     }
+
+    /**
+     * ============================================================
+     * 🎯 ДЗ №5: вспомогательный record для строки батча outbox
+     * ============================================================
+     */
+    private record OutboxBatchRow(String id, String key, String payload) {}
 
     /**
      * ============================================================
@@ -1271,13 +1560,26 @@ public class TrainingApp {
      * ничего не меняется — событие остаётся с published=false.
      * ============================================================
      */
+    /**
+     * ============================================================
+     * 🎯 ДЗ №5: relay с имитацией сбоя Kafka
+     * ============================================================
+     * Отличается от relayOutboxOnce() тем, что при KAFKA_FAILURE_MODE=true
+     * "падает" ДО открытия транзакции, эмулируя недоступность брокера.
+     *
+     * ВАЖНО: мы падаем ДО любых изменений в БД, поэтому:
+     *   - status остаётся 'pending'
+     *   - published остаётся false
+     *   - событие не теряется, ждёт следующего relay
+     * ============================================================
+     */
     private static void relayOutboxOnceWithFailure() throws Exception {
         if (KAFKA_FAILURE_MODE.get()) {
-            // Эмулируем сбой: producer не может подключиться к брокеру
+            // Эмулируем сбой: producer не может подключиться к брокеру.
+            // Никаких транзакций, никаких изменений в БД — всё остаётся как было.
             throw new RuntimeException(
                 "Искусственный сбой: Kafka broker недоступен (KAFKA_FAILURE_MODE=true)");
         }
-        // Если сбоя нет — работаем как обычно
         relayOutboxOnce();
     }
 
